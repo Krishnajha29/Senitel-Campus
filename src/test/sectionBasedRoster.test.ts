@@ -739,4 +739,210 @@ describe('Sentinel Campus — Institutional Section-Based Automatic Student Rost
     // Reset back to default
     LocalDatabase.setCurrentInstructor(null);
   });
+
+  // 14. Test B & C: Three subjects (Circular Linked List, Express.js, Data Structures and Algorithms)
+  // for the same Section A with unicode dashes, verifying exact same students and Section B isolation
+  it('14. shares the exact same student roster across Express.js, Circular Linked List, and Data Structures without manual enrollments, maintaining Section B isolation', () => {
+    // Section A with unicode en-dash
+    const sectionA = LocalDatabase.findOrCreateSection({
+      programme: 'B.Tech Software Engineering',
+      batch: '2024–2028',
+      academic_year: '2026–2027',
+      section: 'Section A',
+    });
+
+    // Section B
+    const sectionB = LocalDatabase.findOrCreateSection({
+      programme: 'B.Tech Software Engineering',
+      batch: '2024–2028',
+      academic_year: '2026–2027',
+      section: 'Section B',
+    });
+
+    // 2 Students in Section A
+    const studentA1 = LocalDatabase.createStudent({
+      full_name: 'Alice Section A',
+      roll_number: 'SE-A-01',
+      course: 'B.Tech Software Engineering',
+      batch: '2024-2028', // hyphen variant
+      academic_year: '2026-2027',
+      section: 'A',
+      section_id: sectionA.id,
+      photo_path: 'photos/a1.jpg',
+      is_active: true,
+    });
+
+    const studentA2 = LocalDatabase.createStudent({
+      full_name: 'Bob Section A',
+      roll_number: 'SE-A-02',
+      course: 'B.Tech Software Engineering',
+      batch: '2024–2028', // en-dash variant
+      academic_year: '2026–2027',
+      section: 'A',
+      section_id: sectionA.id,
+      photo_path: 'photos/a2.jpg',
+      is_active: true,
+    });
+
+    // 1 Student in Section B
+    const studentB1 = LocalDatabase.createStudent({
+      full_name: 'Charlie Section B',
+      roll_number: 'SE-B-01',
+      course: 'B.Tech Software Engineering',
+      batch: '2024–2028',
+      academic_year: '2026–2027',
+      section: 'B',
+      section_id: sectionB.id,
+      photo_path: 'photos/b1.jpg',
+      is_active: true,
+    });
+
+    // Create 3 subject offerings assigned to Section A
+    const subject1 = LocalDatabase.createClass({
+      name: 'Circular Linked List',
+      code: 'CS202',
+      section: 'A',
+      academic_year: '2026-2027',
+      programme: 'B.Tech Software Engineering',
+      batch: '2024-2028',
+      section_id: sectionA.id,
+      enrollment_type: 'section',
+      is_active: true,
+    });
+
+    const subject2 = LocalDatabase.createClass({
+      name: 'Express.js',
+      code: 'CS305',
+      section: 'A',
+      academic_year: '2026-2027',
+      programme: 'B.Tech Software Engineering',
+      batch: '2024-2028',
+      section_id: sectionA.id,
+      enrollment_type: 'section',
+      is_active: true,
+    });
+
+    const subject3 = LocalDatabase.createClass({
+      name: 'Data Structures and Algorithms',
+      code: 'CS201',
+      section: 'A',
+      academic_year: '2026-2027',
+      programme: 'B.Tech Software Engineering',
+      batch: '2024-2028',
+      section_id: sectionA.id,
+      enrollment_type: 'section',
+      is_active: true,
+    });
+
+    // Verify all 3 subjects return the EXACT same Section A students
+    const roster1 = LocalDatabase.getClassEnrollments(subject1.id);
+    const roster2 = LocalDatabase.getClassEnrollments(subject2.id);
+    const roster3 = LocalDatabase.getClassEnrollments(subject3.id);
+
+    expect(roster1.length).toBe(2);
+    expect(roster2.length).toBe(2);
+    expect(roster3.length).toBe(2);
+
+    const ids1 = roster1.map((s) => s.id).sort();
+    const ids2 = roster2.map((s) => s.id).sort();
+    const ids3 = roster3.map((s) => s.id).sort();
+    const expectedIds = [studentA1.id, studentA2.id].sort();
+
+    expect(ids1).toEqual(expectedIds);
+    expect(ids2).toEqual(expectedIds);
+    expect(ids3).toEqual(expectedIds);
+
+    // Verify Section B student is completely isolated and never in any of the 3 rosters
+    expect(ids1).not.toContain(studentB1.id);
+    expect(ids2).not.toContain(studentB1.id);
+    expect(ids3).not.toContain(studentB1.id);
+  });
+
+  // 15. Test D: Face attendance retrieval for Express.js with 128-d face descriptors
+  it('15. loads Express.js full section roster and 128-d face descriptors for face recognition attendance', () => {
+    const sectionA = LocalDatabase.findOrCreateSection({
+      programme: 'B.Tech Software Engineering',
+      batch: '2024-2028',
+      academic_year: '2026-2027',
+      section: 'A',
+    });
+
+    const faceDescriptor128 = Array.from({ length: 128 }, (_, i) => Math.sin(i));
+
+    const studentWithFace = LocalDatabase.createStudent({
+      full_name: 'Face Registered Student',
+      roll_number: 'EXP-01',
+      course: 'B.Tech Software Engineering',
+      batch: '2024-2028',
+      academic_year: '2026-2027',
+      section: 'A',
+      section_id: sectionA.id,
+      photo_path: 'students/exp01.jpg',
+      face_descriptor: faceDescriptor128,
+      face_enrollment_status: 'enrolled',
+      is_active: true,
+    });
+
+    const expressClass = LocalDatabase.createClass({
+      name: 'Express.js',
+      code: 'CS305',
+      section: 'A',
+      academic_year: '2026-2027',
+      programme: 'B.Tech Software Engineering',
+      batch: '2024-2028',
+      section_id: sectionA.id,
+      enrollment_type: 'section',
+      is_active: true,
+    });
+
+    const enrolled = LocalDatabase.getClassEnrollments(expressClass.id);
+    expect(enrolled.length).toBe(1);
+    expect(enrolled[0].id).toBe(studentWithFace.id);
+    expect(enrolled[0].face_descriptor).toHaveLength(128);
+    expect(enrolled[0].face_enrollment_status).toBe('enrolled');
+  });
+
+  // 16. Legacy Class Self-Healing: Class created with only section = 'A' automatically resolves Section A students
+  it('16. self-heals legacy classes that only specify section = "A" without section_id or programme', () => {
+    // Instructor already has Section A students registered
+    const sectionA = LocalDatabase.findOrCreateSection({
+      programme: 'B.Tech Software Engineering',
+      batch: '2024-2028',
+      academic_year: '2026-2027',
+      section: 'A',
+    });
+
+    const student = LocalDatabase.createStudent({
+      full_name: 'Existing Student',
+      roll_number: 'LEG-01',
+      course: 'B.Tech Software Engineering',
+      batch: '2024-2028',
+      academic_year: '2026-2027',
+      section: 'A',
+      section_id: sectionA.id,
+      photo_path: 'photos/leg.jpg',
+      is_active: true,
+    });
+
+    // Create a legacy class with ONLY name and section='A'
+    const legacyClass = LocalDatabase.createClass({
+      name: 'Legacy Subject Without Cohort',
+      code: 'LEG101',
+      section: 'A',
+      academic_year: '2026-2027',
+      is_active: true,
+    });
+
+    // At creation, legacyClass has no section_id
+    expect(legacyClass.section_id).toBeFalsy();
+
+    // Querying enrollments should auto-heal and return the Section A students
+    const roster = LocalDatabase.getClassEnrollments(legacyClass.id);
+    expect(roster.length).toBe(1);
+    expect(roster[0].id).toBe(student.id);
+
+    // Verify the class record in the database was healed with the section_id
+    const healedClass = LocalDatabase.getClassById(legacyClass.id);
+    expect(healedClass?.section_id).toBe(sectionA.id);
+  });
 });

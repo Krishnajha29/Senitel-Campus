@@ -114,6 +114,29 @@ function getPhoneAccessibleBaseUrl(customOrigin?: string): string {
   return 'http://10.146.38.84:5173';
 }
 
+// ==============================================================================
+// Cohort Normalization Helpers
+// ==============================================================================
+export function normalizeSectionLetter(sec?: string | null): string {
+  if (!sec) return 'A';
+  return sec.replace(/^Section\s+/i, '').replace(/[\s\-_]+/g, '').trim().toUpperCase() || 'A';
+}
+
+export function normalizeYearString(year?: string | null): string {
+  if (!year) return '';
+  return year.replace(/[\u2010-\u2015]/g, '-').replace(/^Year\s+/i, '').trim().toLowerCase();
+}
+
+export function normalizeBatchString(batch?: string | null): string {
+  if (!batch) return '';
+  return batch.replace(/[\u2010-\u2015]/g, '-').replace(/^Batch\s+/i, '').trim().toLowerCase();
+}
+
+export function normalizeProgrammeString(prog?: string | null): string {
+  if (!prog) return '';
+  return prog.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
 export class LocalDatabase {
   // Current active instructor
   static getCurrentInstructor(): Instructor | null {
@@ -210,20 +233,20 @@ export class LocalDatabase {
     const instructor = this.getCurrentInstructor();
     if (!instructor) throw new Error('Not authenticated');
 
-    const cleanSection = (data.section || (data as any).name || 'A').replace(/^Section\s+/i, '').trim().toUpperCase() || 'A';
+    const cleanSection = normalizeSectionLetter(data.section || (data as any).name);
     const cleanName = data.name || `Section ${cleanSection}`;
     const cleanProg = data.programme.trim();
-    const cleanBatch = data.batch.trim();
-    const cleanYear = data.academic_year.trim();
+    const cleanBatch = normalizeBatchString(data.batch) || data.batch.trim();
+    const cleanYear = normalizeYearString(data.academic_year) || data.academic_year.trim();
 
     const sections = loadData<AcademicSection[]>(STORAGE_KEYS.SECTIONS, []);
     const exists = sections.some(
       (s) =>
         s.instructor_id === instructor.id &&
-        s.programme.toLowerCase() === cleanProg.toLowerCase() &&
-        s.batch.toLowerCase() === cleanBatch.toLowerCase() &&
-        s.academic_year.toLowerCase() === cleanYear.toLowerCase() &&
-        (s.section?.toUpperCase() === cleanSection || s.name?.toUpperCase() === cleanName.toUpperCase())
+        normalizeProgrammeString(s.programme) === normalizeProgrammeString(cleanProg) &&
+        normalizeBatchString(s.batch) === normalizeBatchString(cleanBatch) &&
+        normalizeYearString(s.academic_year) === normalizeYearString(cleanYear) &&
+        (normalizeSectionLetter(s.section) === cleanSection || normalizeSectionLetter(s.name) === cleanSection)
     );
 
     if (exists) {
@@ -271,28 +294,49 @@ export class LocalDatabase {
   }
 
   static findOrCreateSection(
-    programme: string,
-    batch: string,
-    academic_year: string,
-    name: string,
-    semester?: string
+    paramOrProgramme: string | { programme?: string; batch?: string; academic_year?: string; section?: string; name?: string; semester?: string },
+    posBatch?: string,
+    posAcademicYear?: string,
+    posName?: string,
+    posSemester?: string
   ): AcademicSection {
     const instructor = this.getCurrentInstructor();
     if (!instructor) throw new Error('Not authenticated');
 
-    const cleanName = name.replace(/^Section\s+/i, '').trim().toUpperCase() || 'A';
-    const cleanProg = programme.trim() || 'B.Tech Computer Science';
-    const cleanBatch = batch.trim() || '2024-2028';
-    const cleanYear = academic_year.trim() || '2026-2027';
+    let programme = '';
+    let batch = '';
+    let academic_year = '';
+    let name = '';
+    let semester = '';
+
+    if (typeof paramOrProgramme === 'object' && paramOrProgramme !== null) {
+      programme = paramOrProgramme.programme || '';
+      batch = paramOrProgramme.batch || '';
+      academic_year = paramOrProgramme.academic_year || '';
+      name = paramOrProgramme.section || paramOrProgramme.name || 'A';
+      semester = paramOrProgramme.semester || '';
+    } else {
+      programme = paramOrProgramme || '';
+      batch = posBatch || '';
+      academic_year = posAcademicYear || '';
+      name = posName || 'A';
+      semester = posSemester || '';
+    }
+
+    const cleanSec = normalizeSectionLetter(name);
+    const cleanName = `Section ${cleanSec}`;
+    const cleanProg = (programme && typeof programme === 'string' ? programme.trim() : '') || 'B.Tech Computer Science';
+    const cleanBatch = normalizeBatchString(batch) || '2024-2028';
+    const cleanYear = normalizeYearString(academic_year) || '2026-2027';
 
     const sections = loadData<AcademicSection[]>(STORAGE_KEYS.SECTIONS, []);
     const found = sections.find(
       (s) =>
         s.instructor_id === instructor.id &&
-        s.programme.toLowerCase() === cleanProg.toLowerCase() &&
-        s.batch.toLowerCase() === cleanBatch.toLowerCase() &&
-        s.academic_year.toLowerCase() === cleanYear.toLowerCase() &&
-        s.name.toUpperCase() === cleanName
+        normalizeProgrammeString(s.programme) === normalizeProgrammeString(cleanProg) &&
+        normalizeBatchString(s.batch) === cleanBatch &&
+        normalizeYearString(s.academic_year) === cleanYear &&
+        (normalizeSectionLetter(s.section) === cleanSec || normalizeSectionLetter(s.name) === cleanSec)
     );
 
     if (found) return found;
@@ -300,8 +344,8 @@ export class LocalDatabase {
     const newSection: AcademicSection = {
       id: 'sec_' + Math.random().toString(36).substring(2, 11),
       instructor_id: instructor.id,
-      name: `Section ${cleanName}`,
-      section: cleanName,
+      name: cleanName,
+      section: cleanSec,
       programme: cleanProg,
       batch: cleanBatch,
       academic_year: cleanYear,
@@ -311,6 +355,7 @@ export class LocalDatabase {
       updated_at: new Date().toISOString(),
       student_count: 0,
     };
+
     sections.push(newSection);
     saveData(STORAGE_KEYS.SECTIONS, sections);
     return newSection;
@@ -706,8 +751,10 @@ export class LocalDatabase {
       (s) => s.instructor_id === instructor.id && s.is_active
     );
 
+    if (!cls) return [];
+
     // If manual enrollment mode is explicitly set
-    if (cls && cls.enrollment_type === 'manual') {
+    if (cls.enrollment_type === 'manual') {
       const enrollments = loadData<ClassEnrollment[]>(STORAGE_KEYS.ENROLLMENTS, []).filter(
         (e) => e.class_id === classId
       );
@@ -717,40 +764,79 @@ export class LocalDatabase {
 
     const rosterMap = new Map<string, Student>();
 
-    if (cls) {
-      // 1. Direct section_id match
-      if (cls.section_id) {
-        allStudents.forEach((s) => {
-          if (s.section_id === cls.section_id) {
-            rosterMap.set(s.id, s);
-          }
-        });
-      }
+    // Resolve canonical section for class
+    let sectionObj: AcademicSection | null = null;
+    if (cls.section_id) {
+      sectionObj = this.getSectionById(cls.section_id);
+    }
 
-      // 2. Cohort match (programme/course, batch, academic_year, section)
-      const targetSec = (cls.section || 'A').replace(/^Section\s+/i, '').trim().toUpperCase();
-      const targetYear = (cls.academic_year || '').trim().toLowerCase();
-      const targetProg = (cls.programme || '').trim().toLowerCase();
-      const targetBatch = (cls.batch || '').trim().toLowerCase();
+    const targetSec = normalizeSectionLetter(cls.section || sectionObj?.section || 'A');
+    const targetYear = normalizeYearString(cls.academic_year || sectionObj?.academic_year);
+    const targetProg = normalizeProgrammeString(cls.programme || sectionObj?.programme);
+    const targetBatch = normalizeBatchString(cls.batch || sectionObj?.batch);
 
+    // 1. Direct section_id match
+    if (cls.section_id) {
       allStudents.forEach((s) => {
-        const sSec = (s.section || '').replace(/^Section\s+/i, '').trim().toUpperCase();
-        const sYear = (s.academic_year || '').trim().toLowerCase();
-        const sCourse = (s.course || '').trim().toLowerCase();
-        const sBatch = (s.batch || '').trim().toLowerCase();
-
-        const secMatches = sSec === targetSec;
-        const yearMatches = !targetYear || sYear === targetYear;
-        const progMatches = !targetProg || sCourse === targetProg;
-        const batchMatches = !targetBatch || sBatch === targetBatch;
-
-        if (secMatches && yearMatches && progMatches && batchMatches) {
+        if (s.section_id === cls.section_id) {
           rosterMap.set(s.id, s);
         }
       });
     }
 
-    // 3. Union with any explicit manual enrollments in class_enrollments (e.g. cross-section electives)
+    // 2. Cohort attribute match (heals students who may not have section_id populated yet)
+    allStudents.forEach((s) => {
+      const sSec = normalizeSectionLetter(s.section);
+      const sYear = normalizeYearString(s.academic_year);
+      const sProg = normalizeProgrammeString(s.course);
+      const sBatch = normalizeBatchString(s.batch);
+
+      const secMatches = sSec === targetSec;
+      const yearMatches = !targetYear || !sYear || sYear === targetYear;
+      const progMatches = !targetProg || !sProg || sProg === targetProg;
+      const batchMatches = !targetBatch || !sBatch || sBatch === targetBatch;
+
+      if (secMatches && yearMatches && progMatches && batchMatches) {
+        rosterMap.set(s.id, s);
+      }
+    });
+
+    // 3. Fallback for legacy classes without explicit programme (e.g. Express.js created with only section):
+    // If roster is still empty, and this class has a section letter (e.g. 'A'):
+    // match active students belonging to that section letter & year
+    if (rosterMap.size === 0 && targetSec) {
+      const sectionStudents = allStudents.filter((s) => {
+        const sSec = normalizeSectionLetter(s.section);
+        const sYear = normalizeYearString(s.academic_year);
+        return sSec === targetSec && (!targetYear || !sYear || sYear === targetYear);
+      });
+
+      if (sectionStudents.length > 0) {
+        sectionStudents.forEach((s) => rosterMap.set(s.id, s));
+      }
+    }
+
+    // Auto-heal class cohort / section_id if not set but active students in roster belong to a section
+    if (!cls.section_id && rosterMap.size > 0) {
+      const firstWithSec = Array.from(rosterMap.values()).find((s) => s.section_id);
+      if (firstWithSec?.section_id) {
+        cls.section_id = firstWithSec.section_id;
+        const sec = this.getSectionById(firstWithSec.section_id);
+        if (sec) {
+          cls.programme = sec.programme;
+          cls.batch = sec.batch;
+          cls.academic_year = sec.academic_year;
+        }
+        const classes = loadData<ClassCourse[]>(STORAGE_KEYS.CLASSES, []);
+        const idx = classes.findIndex((c) => c.id === cls.id);
+        if (idx >= 0) {
+          classes[idx] = { ...cls };
+          saveData(STORAGE_KEYS.CLASSES, classes);
+        }
+      }
+    }
+
+    // 4. Union with explicit manual enrollments (e.g. cross-section electives)
     const enrollments = loadData<ClassEnrollment[]>(STORAGE_KEYS.ENROLLMENTS, []).filter(
       (e) => e.class_id === classId
     );
@@ -2747,6 +2833,38 @@ export class LocalDatabase {
         created_at: new Date(Date.now() - 24 * 86400000).toISOString(),
         updated_at: new Date().toISOString(),
       },
+      {
+        id: 'cls-103',
+        instructor_id: instructor.id,
+        name: 'Express.js',
+        code: 'CS302',
+        academic_year: 'Year 2',
+        section: 'A',
+        section_id: 'sec-101',
+        programme: 'B.Tech Computer Science',
+        batch: 'Batch 2024-2028',
+        enrollment_type: 'section',
+        description: 'Server-side Node.js architectures, middleware pipelines, and REST APIs.',
+        is_active: true,
+        created_at: new Date(Date.now() - 23 * 86400000).toISOString(),
+        updated_at: new Date().toISOString(),
+      },
+      {
+        id: 'cls-104',
+        instructor_id: instructor.id,
+        name: 'Circular Linked List',
+        code: 'CS205',
+        academic_year: 'Year 2',
+        section: 'A',
+        section_id: 'sec-101',
+        programme: 'B.Tech Computer Science',
+        batch: 'Batch 2024-2028',
+        enrollment_type: 'section',
+        description: 'Circular list implementations, pointers, memory dynamics, and ring buffer caches.',
+        is_active: true,
+        created_at: new Date(Date.now() - 22 * 86400000).toISOString(),
+        updated_at: new Date().toISOString(),
+      },
     ];
 
     const demoEnrollments: ClassEnrollment[] = [
@@ -2783,9 +2901,55 @@ export class LocalDatabase {
         created_at: new Date(Date.now() - 2 * 86400000).toISOString(),
         updated_at: new Date().toISOString(),
       },
+      {
+        id: 'ses-103',
+        class_id: 'cls-103',
+        instructor_id: instructor.id,
+        title: 'Lecture 01: Express Middleware & Routing',
+        session_date: todayStr,
+        start_time: '11:00',
+        end_time: '12:30',
+        status: 'active',
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      },
     ];
 
     const demoRecords: AttendanceRecord[] = [
+      // Session 103 (Express.js) records for all Section A students
+      {
+        id: 'rec-103-1',
+        session_id: 'ses-103',
+        student_id: 'stu-101',
+        status: 'unmarked',
+        marked_by: instructor.id,
+        marked_at: new Date().toISOString(),
+        method: 'manual',
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      },
+      {
+        id: 'rec-103-2',
+        session_id: 'ses-103',
+        student_id: 'stu-102',
+        status: 'unmarked',
+        marked_by: instructor.id,
+        marked_at: new Date().toISOString(),
+        method: 'manual',
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      },
+      {
+        id: 'rec-103-3',
+        session_id: 'ses-103',
+        student_id: 'stu-103',
+        status: 'unmarked',
+        marked_by: instructor.id,
+        marked_at: new Date().toISOString(),
+        method: 'manual',
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      },
       // Session 101 records
       {
         id: 'rec-1',

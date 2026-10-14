@@ -1,5 +1,11 @@
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
-import { LocalDatabase } from './localDb';
+import {
+  LocalDatabase,
+  normalizeSectionLetter,
+  normalizeYearString,
+  normalizeBatchString,
+  normalizeProgrammeString,
+} from './localDb';
 import { uploadStudentPhoto, getStudentPhotoUrl, deleteStudentPhoto } from './storage';
 import type {
   Instructor,
@@ -159,6 +165,98 @@ export class ApiService {
   // -------------------------------------------------------------
   // Academic Sections (Institutional Cohorts)
   // -------------------------------------------------------------
+  static async deriveSectionsFromExistingData(
+    instructorId: string,
+    filters?: {
+      programme?: string;
+      batch?: string;
+      academic_year?: string;
+      is_active?: boolean | null;
+    }
+  ): Promise<AcademicSection[]> {
+    try {
+      const { data: students } = await supabase
+        .from('students')
+        .select('*')
+        .eq('instructor_id', instructorId);
+
+      const { data: classes } = await supabase
+        .from('classes')
+        .select('*')
+        .eq('instructor_id', instructorId);
+
+      const sectionMap = new Map<string, AcademicSection>();
+
+      (students || []).forEach((s: any) => {
+        const prog = (s.course || 'B.Tech Computer Science').trim();
+        const batch = normalizeBatchString(s.batch) || (s.batch || '2024-2028').trim();
+        const year = normalizeYearString(s.academic_year) || (s.academic_year || '2026-2027').trim();
+        const sec = normalizeSectionLetter(s.section || 'A');
+        const key = `${prog}__${batch}__${year}__${sec}`.toLowerCase();
+
+        if (!sectionMap.has(key)) {
+          sectionMap.set(key, {
+            id: `sec_${sec.toLowerCase()}_${prog.replace(/[^a-zA-Z0-9]/g, '_').toLowerCase()}`,
+            instructor_id: instructorId,
+            name: `Section ${sec}`,
+            section: sec,
+            programme: prog,
+            batch: batch,
+            academic_year: year,
+            semester: 'Semester 4',
+            is_active: true,
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+            student_count: 0,
+          });
+        }
+        if (s.is_active) {
+          sectionMap.get(key)!.student_count = (sectionMap.get(key)!.student_count || 0) + 1;
+        }
+      });
+
+      (classes || []).forEach((c: any) => {
+        const prog = (c.programme || 'B.Tech Computer Science').trim();
+        const batch = normalizeBatchString(c.batch) || (c.batch || '2024-2028').trim();
+        const year = normalizeYearString(c.academic_year) || (c.academic_year || '2026-2027').trim();
+        const sec = normalizeSectionLetter(c.section || 'A');
+        const key = `${prog}__${batch}__${year}__${sec}`.toLowerCase();
+
+        if (!sectionMap.has(key)) {
+          sectionMap.set(key, {
+            id: `sec_${sec.toLowerCase()}_${prog.replace(/[^a-zA-Z0-9]/g, '_').toLowerCase()}`,
+            instructor_id: instructorId,
+            name: `Section ${sec}`,
+            section: sec,
+            programme: prog,
+            batch: batch,
+            academic_year: year,
+            semester: c.semester || 'Semester 4',
+            is_active: true,
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+            student_count: 0,
+          });
+        }
+      });
+
+      let res = Array.from(sectionMap.values());
+      if (filters?.programme) {
+        res = res.filter((s) => normalizeProgrammeString(s.programme) === normalizeProgrammeString(filters.programme));
+      }
+      if (filters?.batch) {
+        res = res.filter((s) => normalizeBatchString(s.batch) === normalizeBatchString(filters.batch));
+      }
+      if (filters?.academic_year) {
+        res = res.filter((s) => normalizeYearString(s.academic_year) === normalizeYearString(filters.academic_year));
+      }
+      return res;
+    } catch (e) {
+      console.warn('Error deriving sections from data:', e);
+      return [];
+    }
+  }
+
   static async getSections(filters?: {
     programme?: string;
     batch?: string;
@@ -182,22 +280,26 @@ export class ApiService {
       if (filters?.academic_year) query = query.eq('academic_year', filters.academic_year);
 
       const { data, error } = await query.order('programme').order('name');
-      if (error || !data) return [];
+      if (!error && data && data.length > 0) {
+        return data.map((sec: any) => ({
+          id: sec.id,
+          instructor_id: sec.instructor_id,
+          name: sec.name || `Section ${sec.section || 'A'}`,
+          section: sec.section || sec.name?.replace(/^Section\s+/i, '') || 'A',
+          programme: sec.programme,
+          batch: sec.batch,
+          academic_year: sec.academic_year,
+          semester: sec.semester,
+          is_active: sec.is_active,
+          created_at: sec.created_at,
+          updated_at: sec.updated_at,
+          student_count: (sec.students || []).filter((s: any) => s.is_active).length,
+        }));
+      }
 
-      return data.map((sec: any) => ({
-        id: sec.id,
-        instructor_id: sec.instructor_id,
-        name: sec.name || `Section ${sec.section || 'A'}`,
-        section: sec.section || sec.name?.replace(/^Section\s+/i, '') || 'A',
-        programme: sec.programme,
-        batch: sec.batch,
-        academic_year: sec.academic_year,
-        semester: sec.semester,
-        is_active: sec.is_active,
-        created_at: sec.created_at,
-        updated_at: sec.updated_at,
-        student_count: (sec.students || []).filter((s: any) => s.is_active).length,
-      }));
+      // Self-healing fallback: If academic_sections table does not exist or has 0 rows,
+      // derive canonical sections from existing registered students and classes
+      return this.deriveSectionsFromExistingData(instructor.id, filters);
     }
 
     return LocalDatabase.getSections(filters);
@@ -488,15 +590,19 @@ export class ApiService {
       throw new Error('Profile picture is required for student registration.');
     }
 
-    const payload = {
+    const cleanSection = normalizeSectionLetter(studentData.section);
+    const cleanBatch = normalizeBatchString(studentData.batch) || studentData.batch.trim();
+    const cleanYear = normalizeYearString(studentData.academic_year) || studentData.academic_year.trim();
+
+    const payload: any = {
       instructor_id: instructor.id,
       roll_number: cleanRoll,
       full_name: studentData.full_name.trim(),
       email: studentData.email ? studentData.email.trim() : null,
       course: studentData.course.trim(),
-      batch: studentData.batch.trim(),
-      academic_year: studentData.academic_year.trim(),
-      section: studentData.section.trim(),
+      batch: cleanBatch,
+      academic_year: cleanYear,
+      section: cleanSection,
       photo_path: photoPath,
       is_active: studentData.is_active ?? true,
       face_descriptor: studentData.face_descriptor || null,
@@ -506,29 +612,53 @@ export class ApiService {
         (studentData.face_descriptor ? 'enrolled' : 'not_enrolled'),
       face_quality_score: studentData.face_quality_score || null,
     };
+    if (studentData.section_id) {
+      payload.section_id = studentData.section_id;
+    }
 
     const targetClassId = (studentData as any).class_id;
 
     if (isSupabaseConfigured()) {
+      let createdData: any = null;
+      let createErr: any = null;
+
       const { data, error } = await supabase
         .from('students')
         .insert(payload)
         .select()
         .single();
 
-      if (error) {
+      if (!error && data) {
+        createdData = data;
+      } else if (error && error.message?.includes('column')) {
+        const { section_id: _sec, ...basicPayload } = payload;
+        const res2 = await supabase
+          .from('students')
+          .insert(basicPayload)
+          .select()
+          .single();
+        if (res2.error) {
+          createErr = res2.error;
+        } else {
+          createdData = res2.data;
+        }
+      } else {
+        createErr = error;
+      }
+
+      if (createErr) {
         // Rollback uploaded photo if DB insert fails
         if (photoFile && photoPath) {
           await deleteStudentPhoto(photoPath).catch(() => {});
         }
-        if (error.code === '23505') {
+        if (createErr.code === '23505') {
           throw new Error(`This roll number already exists (${cleanRoll}).`);
         }
-        throw new Error(`Database error: ${error.message}`);
+        throw new Error(`Database error: ${createErr.message}`);
       }
 
       const createdStudent = {
-        ...(data as Student),
+        ...(createdData as Student),
         photo_url: photoUrl,
       };
 
@@ -592,6 +722,16 @@ export class ApiService {
       cleanUpdates.roll_number = cleanRoll;
     }
 
+    if (cleanUpdates.section) {
+      cleanUpdates.section = normalizeSectionLetter(cleanUpdates.section);
+    }
+    if (cleanUpdates.batch) {
+      cleanUpdates.batch = normalizeBatchString(cleanUpdates.batch) || cleanUpdates.batch.trim();
+    }
+    if (cleanUpdates.academic_year) {
+      cleanUpdates.academic_year = normalizeYearString(cleanUpdates.academic_year) || cleanUpdates.academic_year.trim();
+    }
+
     let photoUrl = updates.photo_url;
     if (newPhotoFile) {
       const uploadRes = await uploadStudentPhoto(newPhotoFile, instructor.id, onProgress);
@@ -602,6 +742,9 @@ export class ApiService {
     let updatedStudent: Student;
 
     if (isSupabaseConfigured()) {
+      let updatedData: any = null;
+      let updateError: any = null;
+
       const { data, error } = await supabase
         .from('students')
         .update({
@@ -613,16 +756,39 @@ export class ApiService {
         .select()
         .single();
 
-      if (error) {
-        if (error.code === '23505') {
+      if (!error && data) {
+        updatedData = data;
+      } else if (error && error.message?.includes('column')) {
+        const { section_id: _sec, ...basicUpdates } = cleanUpdates;
+        const res2 = await supabase
+          .from('students')
+          .update({
+            ...basicUpdates,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', id)
+          .eq('instructor_id', instructor.id)
+          .select()
+          .single();
+        if (res2.error) {
+          updateError = res2.error;
+        } else {
+          updatedData = res2.data;
+        }
+      } else {
+        updateError = error;
+      }
+
+      if (updateError) {
+        if (updateError.code === '23505') {
           throw new Error('This roll number already exists.');
         }
-        throw new Error(`Update failed: ${error.message}`);
+        throw new Error(`Update failed: ${updateError.message}`);
       }
 
       updatedStudent = {
-        ...(data as Student),
-        photo_url: photoUrl || (await getStudentPhotoUrl(data.photo_path)),
+        ...(updatedData as Student),
+        photo_url: photoUrl || (await getStudentPhotoUrl(updatedData.photo_path)),
       };
 
       // Handle class enrollment updates
@@ -686,19 +852,41 @@ export class ApiService {
       const instructor = await this.getCurrentInstructor();
       if (!instructor) return [];
 
-      const { data, error } = await supabase
+      let data: any[] = [];
+      const res1 = await supabase
         .from('classes')
         .select('*, academic_sections(*), class_enrollments(count)')
         .eq('instructor_id', instructor.id)
         .order('name');
 
-      if (error) {
-        console.error('Error fetching classes:', error);
-        return [];
+      if (!res1.error && res1.data) {
+        data = res1.data;
+      } else {
+        // Fallback without relation if table or relationship not yet migrated in Supabase
+        const res2 = await supabase
+          .from('classes')
+          .select('*, class_enrollments(count)')
+          .eq('instructor_id', instructor.id)
+          .order('name');
+
+        if (!res2.error && res2.data) {
+          data = res2.data;
+        } else {
+          const res3 = await supabase
+            .from('classes')
+            .select('*')
+            .eq('instructor_id', instructor.id)
+            .order('name');
+          if (res3.error) {
+            console.error('Error fetching classes:', res3.error);
+            return [];
+          }
+          data = res3.data || [];
+        }
       }
 
       const withCounts = await Promise.all(
-        (data || []).map(async (c: any) => {
+        data.map(async (c: any) => {
           let count = c.class_enrollments?.[0]?.count || 0;
           try {
             const roster = await this.getClassEnrollments(c.id);
@@ -723,14 +911,27 @@ export class ApiService {
       const instructor = await this.getCurrentInstructor();
       if (!instructor) return null;
 
-      const { data, error } = await supabase
+      let data: any = null;
+      const res1 = await supabase
         .from('classes')
         .select('*, academic_sections(*), class_enrollments(count)')
         .eq('id', id)
         .eq('instructor_id', instructor.id)
         .single();
 
-      if (error || !data) return null;
+      if (!res1.error && res1.data) {
+        data = res1.data;
+      } else {
+        const res2 = await supabase
+          .from('classes')
+          .select('*')
+          .eq('id', id)
+          .eq('instructor_id', instructor.id)
+          .single();
+        if (res2.error || !res2.data) return null;
+        data = res2.data;
+      }
+
       let count = data.class_enrollments?.[0]?.count || 0;
       try {
         const roster = await this.getClassEnrollments(id);
@@ -753,34 +954,56 @@ export class ApiService {
     if (!instructor) throw new Error('Not authenticated');
 
     const cleanCode = classData.code.trim().toUpperCase();
-    const cleanSection = classData.section.trim().toUpperCase();
+    const cleanSection = normalizeSectionLetter(classData.section);
 
-    const payload = {
+    const payload: any = {
       ...classData,
       instructor_id: instructor.id,
       name: classData.name.trim(),
       code: cleanCode,
       section: cleanSection,
-      academic_year: classData.academic_year.trim(),
+      academic_year: normalizeYearString(classData.academic_year) || classData.academic_year.trim(),
       description: classData.description ? classData.description.trim() : null,
       is_active: classData.is_active ?? true,
     };
 
     if (isSupabaseConfigured()) {
+      let insertedData: any = null;
+      let insertError: any = null;
+
       const { data, error } = await supabase
         .from('classes')
         .insert(payload)
         .select()
         .single();
 
-      if (error) {
-        if (error.code === '23505') {
-          throw new Error(`A class with code ${cleanCode} and section ${cleanSection} already exists.`);
+      if (!error && data) {
+        insertedData = data;
+      } else if (error && error.message?.includes('column')) {
+        // Fallback for unmigrated schema: strip non-standard columns
+        const { section_id: _s, programme: _p, batch: _b, semester: _sem, enrollment_type: _e, ...basicPayload } = payload;
+        const res2 = await supabase
+          .from('classes')
+          .insert(basicPayload)
+          .select()
+          .single();
+        if (res2.error) {
+          insertError = res2.error;
+        } else {
+          insertedData = res2.data;
         }
-        throw new Error(error.message);
+      } else {
+        insertError = error;
       }
 
-      return { ...(data as ClassCourse), enrolled_count: 0 };
+      if (insertError) {
+        if (insertError.code === '23505') {
+          throw new Error(`A class with code ${cleanCode} and section ${cleanSection} already exists.`);
+        }
+        throw new Error(insertError.message);
+      }
+
+      return { ...(insertedData as ClassCourse), enrolled_count: 0 };
     }
 
     return LocalDatabase.createClass(payload);
@@ -791,6 +1014,9 @@ export class ApiService {
     if (!instructor) throw new Error('Not authenticated');
 
     if (isSupabaseConfigured()) {
+      let updatedData: any = null;
+      let updateError: any = null;
+
       const { data, error } = await supabase
         .from('classes')
         .update({ ...updates, updated_at: new Date().toISOString() })
@@ -799,14 +1025,34 @@ export class ApiService {
         .select()
         .single();
 
-      if (error) {
-        if (error.code === '23505') {
-          throw new Error('A class with this code and section already exists.');
+      if (!error && data) {
+        updatedData = data;
+      } else if (error && error.message?.includes('column')) {
+        const { section_id: _s, programme: _p, batch: _b, semester: _sem, enrollment_type: _e, ...basicUpdates } = updates as any;
+        const res2 = await supabase
+          .from('classes')
+          .update({ ...basicUpdates, updated_at: new Date().toISOString() })
+          .eq('id', id)
+          .eq('instructor_id', instructor.id)
+          .select()
+          .single();
+        if (res2.error) {
+          updateError = res2.error;
+        } else {
+          updatedData = res2.data;
         }
-        throw new Error(error.message);
+      } else {
+        updateError = error;
       }
 
-      return data as ClassCourse;
+      if (updateError) {
+        if (updateError.code === '23505') {
+          throw new Error('A class with this code and section already exists.');
+        }
+        throw new Error(updateError.message);
+      }
+
+      return updatedData as ClassCourse;
     }
 
     return LocalDatabase.updateClass(id, updates);
@@ -820,54 +1066,79 @@ export class ApiService {
         .eq('id', classId)
         .single();
 
-      if (classErr) {
+      if (classErr || !classObj) {
         console.error('Error fetching class in getClassEnrollments:', classErr);
-        throw new Error(`Database error loading class: ${classErr.message}`);
+        return [];
       }
 
       const rosterMap = new Map<string, Student>();
 
       // 1. If section-based class (or default), fetch all active students belonging to that section/cohort
       if (!classObj.enrollment_type || classObj.enrollment_type === 'section') {
-        let sectionStudentsQuery = supabase
-          .from('students')
-          .select('*')
-          .eq('instructor_id', classObj.instructor_id)
-          .eq('is_active', true);
+        const targetSec = normalizeSectionLetter(classObj.section);
+        const targetYear = normalizeYearString(classObj.academic_year);
+        const targetProg = normalizeProgrammeString(classObj.programme);
+        const targetBatch = normalizeBatchString(classObj.batch);
 
+        // A. Direct section_id query if section_id is populated
         if (classObj.section_id) {
-          sectionStudentsQuery = sectionStudentsQuery.eq('section_id', classObj.section_id);
-        } else {
-          // Cohort fallback
-          const targetSec = (classObj.section || 'A').replace(/^Section\s+/i, '').trim();
-          sectionStudentsQuery = sectionStudentsQuery.or(`section.ilike.${targetSec},section.ilike.Section ${targetSec}`);
-          if (classObj.academic_year) {
-            sectionStudentsQuery = sectionStudentsQuery.eq('academic_year', classObj.academic_year);
-          }
-          if (classObj.programme) {
-            sectionStudentsQuery = sectionStudentsQuery.ilike('course', classObj.programme);
-          }
-          if (classObj.batch) {
-            sectionStudentsQuery = sectionStudentsQuery.ilike('batch', classObj.batch);
+          const { data: secStudents, error: secErr } = await supabase
+            .from('students')
+            .select('*')
+            .eq('instructor_id', classObj.instructor_id)
+            .eq('is_active', true)
+            .eq('section_id', classObj.section_id);
+
+          if (!secErr && secStudents && secStudents.length > 0) {
+            secStudents.forEach((s: any) => rosterMap.set(s.id, s as Student));
           }
         }
 
-        const { data: secStudents, error: secErr } = await sectionStudentsQuery;
-        if (secErr) {
-          console.error('Error fetching section students for class:', secErr);
-          throw new Error(`Database error loading section students: ${secErr.message}`);
-        }
+        // B. Cohort fallback or if section_id returned 0
+        if (rosterMap.size === 0) {
+          const { data: allStudents } = await supabase
+            .from('students')
+            .select('*')
+            .eq('instructor_id', classObj.instructor_id)
+            .eq('is_active', true);
 
-        (secStudents || []).forEach((s: any) => rosterMap.set(s.id, s as Student));
+          (allStudents || []).forEach((s: any) => {
+            const sSec = normalizeSectionLetter(s.section);
+            const sYear = normalizeYearString(s.academic_year);
+            const sProg = normalizeProgrammeString(s.course);
+            const sBatch = normalizeBatchString(s.batch);
+
+            const secMatches = sSec === targetSec;
+            const yearMatches = !targetYear || !sYear || sYear === targetYear;
+            const progMatches = !targetProg || !sProg || sProg === targetProg;
+            const batchMatches = !targetBatch || !sBatch || sBatch === targetBatch;
+
+            if (secMatches && yearMatches && progMatches && batchMatches) {
+              rosterMap.set(s.id, s as Student);
+            }
+          });
+
+          // C. Legacy fallback: If class has no programme (e.g. Express.js created with only section):
+          // Match all active students in this instructor's directory with matching section letter & year
+          if (rosterMap.size === 0 && targetSec) {
+            (allStudents || []).forEach((s: any) => {
+              const sSec = normalizeSectionLetter(s.section);
+              const sYear = normalizeYearString(s.academic_year);
+              if (sSec === targetSec && (!targetYear || !sYear || sYear === targetYear)) {
+                rosterMap.set(s.id, s as Student);
+              }
+            });
+          }
+        }
       }
 
       // 2. Also union with explicit manual enrollments (e.g. cross-section electives)
-      const { data: explicitData, error: explicitErr } = await supabase
+      const { data: explicitData } = await supabase
         .from('class_enrollments')
         .select('student_id, students(*)')
         .eq('class_id', classId);
 
-      if (!explicitErr && explicitData) {
+      if (explicitData) {
         explicitData.forEach((d: any) => {
           if (d.students && d.students.is_active) {
             rosterMap.set(d.students.id, d.students as Student);
@@ -875,7 +1146,9 @@ export class ApiService {
         });
       }
 
-      const finalStudents = Array.from(rosterMap.values()).sort((a, b) => a.roll_number.localeCompare(b.roll_number));
+      const finalStudents = Array.from(rosterMap.values()).sort((a, b) =>
+        (a.roll_number || '').localeCompare(b.roll_number || '')
+      );
 
       return Promise.all(
         finalStudents.map(async (s) => ({

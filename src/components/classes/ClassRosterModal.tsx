@@ -104,19 +104,15 @@ export const ClassRosterModal: React.FC<ClassRosterModalProps> = ({
     );
   });
 
-  // Identify matching candidates whose course or batch text matches this class name or code
+  // Identify candidate students whose academic programme matches this class cohort
+  const targetProgramme = (classObj.programme || classObj.section_details?.programme || '').trim().toLowerCase();
   const matchingCandidates = candidateStudents.filter((s) => {
-    const clsName = classObj.name.trim().toLowerCase();
-    const clsCode = classObj.code.trim().toLowerCase();
+    if (!targetProgramme) return false;
     const studentCourse = (s.course || '').trim().toLowerCase();
-    const studentBatch = (s.batch || '').trim().toLowerCase();
     return (
-      studentCourse === clsName ||
-      studentCourse === clsCode ||
-      clsName.includes(studentCourse) ||
-      studentCourse.includes(clsName) ||
-      studentBatch.includes(clsName) ||
-      studentBatch.includes(clsCode)
+      studentCourse === targetProgramme ||
+      studentCourse.includes(targetProgramme) ||
+      targetProgramme.includes(studentCourse)
     );
   });
 
@@ -570,7 +566,7 @@ export const ClassRosterModal: React.FC<ClassRosterModalProps> = ({
                               {isMatchingCourse && (
                                 <span className="inline-flex items-center gap-1 text-[9px] font-bold text-indigo-700 bg-indigo-50 border border-indigo-200 px-1.5 py-0.2 rounded">
                                   <Sparkles className="w-2.5 h-2.5" />
-                                  Course Match
+                                  Programme Match
                                 </span>
                               )}
                             </div>

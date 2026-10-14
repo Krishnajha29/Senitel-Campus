@@ -27,10 +27,30 @@ CREATE TABLE IF NOT EXISTS public.instructors (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
 );
 
--- 1.2 Students Table (with biometric face descriptor extensions)
+-- 1.2 Academic Sections Table (Normalized Institutional Cohorts)
+CREATE TABLE IF NOT EXISTS public.academic_sections (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    instructor_id UUID NOT NULL REFERENCES public.instructors(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,                     -- e.g. 'A' or 'Section A'
+    programme TEXT NOT NULL,                -- e.g. 'B.Tech Software Engineering', 'B.Tech Computer Science'
+    batch TEXT NOT NULL,                    -- e.g. '2024-2028'
+    academic_year TEXT NOT NULL,            -- e.g. '2026-2027'
+    semester TEXT,                          -- e.g. 'Semester 4'
+    is_active BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
+    CONSTRAINT uq_instructor_section_cohort UNIQUE (instructor_id, programme, batch, academic_year, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_academic_sections_instructor ON public.academic_sections(instructor_id);
+CREATE INDEX IF NOT EXISTS idx_academic_sections_cohort ON public.academic_sections(programme, batch, academic_year, name);
+CREATE INDEX IF NOT EXISTS idx_academic_sections_active ON public.academic_sections(is_active);
+
+-- 1.3 Students Table (with biometric face descriptor extensions)
 CREATE TABLE IF NOT EXISTS public.students (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     instructor_id UUID NOT NULL REFERENCES public.instructors(id) ON DELETE CASCADE,
+    section_id UUID REFERENCES public.academic_sections(id) ON DELETE SET NULL,
     roll_number TEXT NOT NULL,
     full_name TEXT NOT NULL,
     email TEXT,
@@ -50,18 +70,24 @@ CREATE TABLE IF NOT EXISTS public.students (
 );
 
 CREATE INDEX IF NOT EXISTS idx_students_instructor ON public.students(instructor_id);
+CREATE INDEX IF NOT EXISTS idx_students_section_id ON public.students(section_id);
 CREATE INDEX IF NOT EXISTS idx_students_roll_number ON public.students(instructor_id, roll_number);
 CREATE INDEX IF NOT EXISTS idx_students_filter ON public.students(course, academic_year, section, is_active);
 CREATE INDEX IF NOT EXISTS idx_students_face_status ON public.students(face_enrollment_status);
 
--- 1.3 Classes Table
+-- 1.4 Classes Table
 CREATE TABLE IF NOT EXISTS public.classes (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     instructor_id UUID NOT NULL REFERENCES public.instructors(id) ON DELETE CASCADE,
+    section_id UUID REFERENCES public.academic_sections(id) ON DELETE SET NULL,
     name TEXT NOT NULL,
     code TEXT NOT NULL,
     academic_year TEXT NOT NULL,
     section TEXT NOT NULL,
+    programme TEXT,
+    batch TEXT,
+    semester TEXT,
+    enrollment_type TEXT NOT NULL DEFAULT 'section' CHECK (enrollment_type IN ('section', 'manual')),
     description TEXT,
     is_active BOOLEAN NOT NULL DEFAULT true,
     created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
@@ -70,9 +96,10 @@ CREATE TABLE IF NOT EXISTS public.classes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_classes_instructor ON public.classes(instructor_id);
+CREATE INDEX IF NOT EXISTS idx_classes_section_id ON public.classes(section_id);
 CREATE INDEX IF NOT EXISTS idx_classes_active ON public.classes(is_active);
 
--- 1.4 Class Enrollments Table
+-- 1.5 Class Enrollments Table
 CREATE TABLE IF NOT EXISTS public.class_enrollments (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     class_id UUID NOT NULL REFERENCES public.classes(id) ON DELETE CASCADE,
@@ -259,6 +286,9 @@ $$ LANGUAGE plpgsql;
 DROP TRIGGER IF EXISTS tr_instructors_updated_at ON public.instructors;
 CREATE TRIGGER tr_instructors_updated_at BEFORE UPDATE ON public.instructors FOR EACH ROW EXECUTE FUNCTION public.handle_updated_at();
 
+DROP TRIGGER IF EXISTS tr_academic_sections_updated_at ON public.academic_sections;
+CREATE TRIGGER tr_academic_sections_updated_at BEFORE UPDATE ON public.academic_sections FOR EACH ROW EXECUTE FUNCTION public.handle_updated_at();
+
 DROP TRIGGER IF EXISTS tr_students_updated_at ON public.students;
 CREATE TRIGGER tr_students_updated_at BEFORE UPDATE ON public.students FOR EACH ROW EXECUTE FUNCTION public.handle_updated_at();
 
@@ -283,6 +313,7 @@ CREATE TRIGGER tr_classroom_photos_updated_at BEFORE UPDATE ON public.classroom_
 -- ==============================================================================
 
 ALTER TABLE public.instructors ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.academic_sections ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.students ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.classes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.class_enrollments ENABLE ROW LEVEL SECURITY;
@@ -305,7 +336,20 @@ CREATE POLICY "Instructors can update own profile" ON public.instructors FOR UPD
 DROP POLICY IF EXISTS "Instructors can insert own profile" ON public.instructors;
 CREATE POLICY "Instructors can insert own profile" ON public.instructors FOR INSERT WITH CHECK (auth.uid() = id);
 
--- 5.2 Students RLS
+-- 5.2 Academic Sections RLS
+DROP POLICY IF EXISTS "Instructors can view own academic sections" ON public.academic_sections;
+CREATE POLICY "Instructors can view own academic sections" ON public.academic_sections FOR SELECT USING (instructor_id = auth.uid());
+
+DROP POLICY IF EXISTS "Instructors can insert own academic sections" ON public.academic_sections;
+CREATE POLICY "Instructors can insert own academic sections" ON public.academic_sections FOR INSERT WITH CHECK (instructor_id = auth.uid());
+
+DROP POLICY IF EXISTS "Instructors can update own academic sections" ON public.academic_sections;
+CREATE POLICY "Instructors can update own academic sections" ON public.academic_sections FOR UPDATE USING (instructor_id = auth.uid());
+
+DROP POLICY IF EXISTS "Instructors can delete own academic sections" ON public.academic_sections;
+CREATE POLICY "Instructors can delete own academic sections" ON public.academic_sections FOR DELETE USING (instructor_id = auth.uid());
+
+-- 5.3 Students RLS
 DROP POLICY IF EXISTS "Instructors can view own students" ON public.students;
 CREATE POLICY "Instructors can view own students" ON public.students FOR SELECT USING (instructor_id = auth.uid());
 

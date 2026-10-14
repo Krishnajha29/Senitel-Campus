@@ -32,6 +32,7 @@ import type {
   Student,
   PhotoUploadSession,
   ClassCourse,
+  AcademicSection,
 } from '../../types';
 import { FaceRecognitionService } from '../../services/faceRecognition';
 import { ApiService } from '../../services/api';
@@ -103,10 +104,11 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
   const [hasLoadedRoster, setHasLoadedRoster] = useState<boolean>(false);
   const [classObj, setClassObj] = useState<ClassCourse | null>(null);
   const [rosterLoading, setRosterLoading] = useState<boolean>(false);
-  const [rosterState, setRosterState] = useState<'loading' | 'ready' | 'empty' | 'unauthorized' | 'db_error'>('loading');
+  const [rosterState, setRosterState] = useState<'loading' | 'ready' | 'empty' | 'no_cohort' | 'unauthorized' | 'db_error'>('loading');
   const [rosterErrorMessage, setRosterErrorMessage] = useState<string | null>(null);
-  const [matchingDirectoryCandidates, setMatchingDirectoryCandidates] = useState<Student[]>([]);
-  const [isEnrollingMatching, setIsEnrollingMatching] = useState<boolean>(false);
+  const [availableSections, setAvailableSections] = useState<AcademicSection[]>([]);
+  const [selectedSectionToAssign, setSelectedSectionToAssign] = useState<string>('');
+  const [isAssigningSection, setIsAssigningSection] = useState<boolean>(false);
   const [isClassRosterModalOpen, setIsClassRosterModalOpen] = useState<boolean>(false);
   const [isExtractingBiometrics, setIsExtractingBiometrics] = useState<boolean>(false);
 
@@ -129,35 +131,25 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
     setRosterLoading(true);
     setRosterErrorMessage(null);
     try {
-      const [classDetails, enrolled, allDirStudents] = await Promise.all([
+      const [classDetails, enrolled, sections] = await Promise.all([
         ApiService.getClassById(session.class_id),
         ApiService.getClassEnrollments(session.class_id),
-        ApiService.getStudents({ is_active: true }).catch(() => []),
+        ApiService.getSections().catch(() => []),
       ]);
       setClassObj(classDetails);
       setLiveEnrolledStudents(enrolled);
+      setAvailableSections(sections);
+      if (sections.length > 0 && !selectedSectionToAssign) {
+        setSelectedSectionToAssign(sections[0].id);
+      }
       setHasLoadedRoster(true);
 
       if (enrolled.length === 0) {
-        setRosterState('empty');
-        const targetName = (session.class_name || classDetails?.name || '').trim().toLowerCase();
-        const targetCode = (session.class_code || classDetails?.code || '').trim().toLowerCase();
-        const matching = allDirStudents.filter((s) => {
-          const sc = (s.course || '').trim().toLowerCase();
-          const sb = (s.batch || '').trim().toLowerCase();
-          return (
-            (targetName &&
-              (sc === targetName ||
-                sc.includes(targetName) ||
-                targetName.includes(sc) ||
-                sb.includes(targetName))) ||
-            (targetCode &&
-              (sc === targetCode ||
-                sc.includes(targetCode) ||
-                sb.includes(targetCode)))
-          );
-        });
-        setMatchingDirectoryCandidates(matching);
+        if (!classDetails?.section_id && !classDetails?.programme) {
+          setRosterState('no_cohort');
+        } else {
+          setRosterState('empty');
+        }
       } else {
         setRosterState('ready');
       }
@@ -182,7 +174,7 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
     } finally {
       setRosterLoading(false);
     }
-  }, [session?.class_id, session?.class_name, session?.class_code]);
+  }, [session?.class_id, selectedSectionToAssign]);
 
   useEffect(() => {
     if (isOpen) {
@@ -191,6 +183,36 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
   }, [isOpen, loadClassRoster]);
 
   const [isSyncingSectionRoster, setIsSyncingSectionRoster] = useState<boolean>(false);
+
+  const handleAssignClassSection = async (sectionId: string) => {
+    if (!classObj?.id || !sectionId) return;
+    try {
+      setIsAssigningSection(true);
+      const targetSec = availableSections.find((s) => s.id === sectionId);
+      if (!targetSec) return;
+      await ApiService.updateClass(classObj.id, {
+        section_id: targetSec.id,
+        programme: targetSec.programme,
+        batch: targetSec.batch,
+        academic_year: targetSec.academic_year,
+        section: targetSec.section || targetSec.name,
+        semester: targetSec.semester || undefined,
+        enrollment_type: 'section',
+      });
+      toast.success(
+        'Section Cohort Assigned',
+        `Assigned ${classObj.name} to ${targetSec.programme} (Sec ${targetSec.section}). Section roster loaded.`
+      );
+      await loadClassRoster();
+      if (onAttendanceSubmitted) {
+        onAttendanceSubmitted();
+      }
+    } catch (err: any) {
+      toast.error('Assignment Failed', err.message);
+    } finally {
+      setIsAssigningSection(false);
+    }
+  };
 
   const handleSyncSectionRoster = async () => {
     if (!session?.id) return;
@@ -212,24 +234,6 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
     }
   };
 
-  const handleAutoEnrollMatching = async () => {
-    if (!session?.class_id || matchingDirectoryCandidates.length === 0) return;
-    try {
-      setIsEnrollingMatching(true);
-      const ids = matchingDirectoryCandidates.map((s) => s.id);
-      await ApiService.enrollStudentsInClass(session.class_id, ids);
-      toast.success(
-        'Auto-Enrollment Complete',
-        `Successfully enrolled ${ids.length} matching students in ${session.class_name || 'this class'}.`
-      );
-      await loadClassRoster();
-      onAttendanceSubmitted();
-    } catch (err: any) {
-      toast.error('Auto-Enrollment Failed', err.message);
-    } finally {
-      setIsEnrollingMatching(false);
-    }
-  };
 
   const handleExtractMissingBiometrics = async () => {
     if (enrolledNeedingBiometrics.length === 0) return;
@@ -1016,41 +1020,81 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
                   </button>
                 </div>
               </div>
+            ) : rosterState === 'no_cohort' ? (
+              <div className="p-4 rounded-2xl bg-amber-50 border-2 border-amber-300 flex items-start gap-3.5 text-xs text-amber-950 shadow-sm">
+                <ShieldAlert className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                <div className="space-y-3 flex-1">
+                  <div>
+                    <p className="font-bold text-amber-900 text-sm">
+                      Academic Section Cohort Not Assigned
+                    </p>
+                    <p className="text-amber-800 leading-relaxed mt-0.5">
+                      Subject offering <strong>{session.class_name || session.class_code || 'selected class'}</strong> has not yet been linked to an institutional academic section. Sentinel Campus rosters are automatically populated from academic sections.
+                    </p>
+                  </div>
+
+                  {availableSections.length > 0 ? (
+                    <div className="p-3 bg-white/90 border border-amber-300 rounded-xl space-y-2">
+                      <p className="font-semibold text-amber-900">
+                        Select an institutional section to automatically link and derive the student roster:
+                      </p>
+                      <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                        <select
+                          value={selectedSectionToAssign}
+                          onChange={(e) => setSelectedSectionToAssign(e.target.value)}
+                          className="px-3 py-1.5 bg-white border border-amber-300 rounded-lg text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-amber-500/20 flex-1"
+                        >
+                          {availableSections.map((sec) => (
+                            <option key={sec.id} value={sec.id}>
+                              {sec.programme} — Section {sec.section} ({sec.batch}, {sec.student_count || 0} students)
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          onClick={() => handleAssignClassSection(selectedSectionToAssign || availableSections[0]?.id)}
+                          disabled={isAssigningSection}
+                          className="px-3.5 py-1.5 bg-brand-600 hover:bg-brand-700 text-white font-bold text-xs rounded-lg transition shadow-xs cursor-pointer shrink-0 disabled:opacity-50 flex items-center justify-center gap-1.5"
+                        >
+                          {isAssigningSection ? (
+                            <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                          ) : (
+                            <Sparkles className="w-3.5 h-3.5 text-amber-300" />
+                          )}
+                          Assign Cohort &amp; Load Roster
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="text-amber-700 italic">
+                      No institutional sections found. Please create an academic section in Classes &amp; Courses.
+                    </p>
+                  )}
+
+                  <div className="flex flex-wrap items-center gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => setIsClassRosterModalOpen(true)}
+                      className="px-3.5 py-1.5 bg-white border border-amber-300 hover:bg-amber-100 text-amber-900 font-bold text-xs rounded-xl transition shadow-xs flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <UserPlus className="w-3.5 h-3.5 text-amber-700" />
+                      Configure Class Cohort in Settings
+                    </button>
+                  </div>
+                </div>
+              </div>
             ) : effectiveRoster.length === 0 ? (
               <div className="p-4 rounded-2xl bg-rose-50 border-2 border-rose-300 flex items-start gap-3.5 text-xs text-rose-950 shadow-sm">
                 <ShieldAlert className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
                 <div className="space-y-2 flex-1">
                   <div>
                     <p className="font-bold text-rose-900 text-sm">
-                      Class Roster Empty (0 Enrolled Students)
+                      Section Cohort Empty (0 Registered Students)
                     </p>
                     <p className="text-rose-800 leading-relaxed mt-0.5">
-                      This lecture belongs to class <strong>{session.class_name || session.class_code || 'selected class'}</strong>, which currently has zero enrolled students. Face recognition matches detected faces against enrolled students; without a roster, no student can be identified.
+                      This lecture belongs to <strong>{session.class_name || session.class_code || 'selected class'}</strong> ({classObj?.programme || 'Cohort'} — Section {classObj?.section || 'A'}), which currently has zero active registered students in this section.
                     </p>
                   </div>
-
-                  {/* 1-Click Auto-Enroll matching students banner */}
-                  {matchingDirectoryCandidates.length > 0 && (
-                    <div className="p-3 bg-white/90 border border-brand-300 rounded-xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2.5">
-                      <div className="flex items-center gap-2">
-                        <Sparkles className="w-4 h-4 text-brand-600 shrink-0" />
-                        <span className="text-xs text-brand-900 font-semibold">
-                          Found {matchingDirectoryCandidates.length} registered student(s) matching "{session.class_name || 'this class'}" in your directory.
-                        </span>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={handleAutoEnrollMatching}
-                        disabled={isEnrollingMatching}
-                        className="px-3 py-1.5 bg-brand-600 hover:bg-brand-700 text-white font-bold text-xs rounded-lg transition shadow-xs cursor-pointer shrink-0 disabled:opacity-50"
-                      >
-                        {isEnrollingMatching ? (
-                          <RefreshCw className="w-3.5 h-3.5 animate-spin inline mr-1" />
-                        ) : null}
-                        Auto-Enroll All {matchingDirectoryCandidates.length}
-                      </button>
-                    </div>
-                  )}
 
                   <div className="flex flex-wrap items-center gap-2 pt-1">
                     <button
@@ -1059,7 +1103,7 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
                       className="px-3.5 py-1.5 bg-white border border-rose-300 hover:bg-rose-100 text-rose-900 font-bold text-xs rounded-xl transition shadow-xs flex items-center gap-1.5 cursor-pointer"
                     >
                       <UserPlus className="w-3.5 h-3.5 text-rose-700" />
-                      Manage Class Roster &amp; Enroll Students
+                      Manage Class Roster &amp; Electives
                     </button>
 
                     <button
