@@ -1,0 +1,1535 @@
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import {
+  Camera,
+  Upload,
+  RefreshCw,
+  CheckCircle2,
+  HelpCircle,
+  Users,
+  X,
+  Sparkles,
+  ShieldAlert,
+  FlipHorizontal,
+  ArrowLeft,
+  Loader2,
+  Check,
+  UserX,
+  ImageIcon,
+  QrCode,
+  Smartphone,
+  Copy,
+  Clock,
+  CheckCircle,
+  XCircle,
+  Layers,
+} from 'lucide-react';
+import type {
+  AttendanceSession,
+  FaceScanSessionSummary,
+  Student,
+  PhotoUploadSession,
+} from '../../types';
+import { FaceRecognitionService } from '../../services/faceRecognition';
+import { ApiService } from '../../services/api';
+import { useToast } from '../common/ToastContext';
+import QRCode from 'qrcode';
+
+interface FaceAttendanceModalProps {
+  isOpen: boolean;
+  session: AttendanceSession;
+  enrolledStudents: Student[];
+  onClose: () => void;
+  onAttendanceSubmitted: () => void;
+}
+
+type Step = 'capture' | 'preview' | 'processing' | 'review' | 'confirming';
+type ReviewTab = 'high_confidence' | 'needs_review' | 'not_detected';
+type CaptureSource = 'qr' | 'webcam';
+
+export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
+  isOpen,
+  session,
+  enrolledStudents,
+  onClose,
+  onAttendanceSubmitted,
+}) => {
+  const toast = useToast();
+
+  // Workflow steps
+  const [currentStep, setCurrentStep] = useState<Step>('capture');
+  const [activeTab, setActiveTab] = useState<ReviewTab>('high_confidence');
+  const [captureSource, setCaptureSource] = useState<CaptureSource>('qr');
+
+  // QR Session state
+  const [uploadSession, setUploadSession] = useState<PhotoUploadSession | null>(null);
+  const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
+  const [uploadUrl, setUploadUrl] = useState<string | null>(null);
+  const [remainingSeconds, setRemainingSeconds] = useState<number>(600);
+  const [isGeneratingQr, setIsGeneratingQr] = useState<boolean>(false);
+  const [isRevokingQr, setIsRevokingQr] = useState<boolean>(false);
+  const [copiedLink, setCopiedLink] = useState<boolean>(false);
+
+  // Camera state (optional fallback)
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [stream, setStream] = useState<MediaStream | null>(null);
+  const [cameraError, setCameraError] = useState<string | null>(null);
+  const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment');
+  const [capturedImage, setCapturedImage] = useState<string | null>(null);
+  const [receivedPhotos, setReceivedPhotos] = useState<{ id: string; name: string; url: string; size?: number }[]>([]);
+  const [batchProgress, setBatchProgress] = useState<{ current: number; total: number; percent: number; photoName: string } | null>(null);
+
+  // Processing state
+  const [processingPhase, setProcessingPhase] = useState<string>('Initializing models...');
+  const [scanSummary, setScanSummary] = useState<FaceScanSessionSummary | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+
+  // Instructor review selections
+  const [selectedHighConfidenceIds, setSelectedHighConfidenceIds] = useState<Set<string>>(new Set());
+  const [resolvedReviewMap, setResolvedReviewMap] = useState<Map<string, string>>(new Map()); // detectionId -> studentId
+  const [manualPresentIds, setManualPresentIds] = useState<Set<string>>(new Set());
+
+  // Enrolled students with face descriptors
+  const enrolledWithFaces = enrolledStudents.filter(
+    (s) => s.face_descriptor && Array.isArray(s.face_descriptor) && s.face_descriptor.length === 128
+  );
+
+  // -------------------------------------------------------------
+  // QR Upload Session Management & Auto-Init
+  // -------------------------------------------------------------
+  const initOrFetchQrSession = useCallback(async () => {
+    if (!session?.id) return;
+    setIsGeneratingQr(true);
+    try {
+      const active = await ApiService.getActivePhotoUploadSession(session.id);
+      if (active) {
+        setUploadSession(active);
+        const url = active.upload_url || `${window.location.origin}/attendance-upload`;
+        setUploadUrl(url);
+        try {
+          const qr = await QRCode.toDataURL(url, { width: 320, margin: 2 });
+          setQrDataUrl(qr);
+        } catch {
+          // Fallback if QRCode generation fails
+        }
+
+        const expMs = new Date(active.expires_at).getTime() - Date.now();
+        setRemainingSeconds(Math.max(0, Math.floor(expMs / 1000)));
+
+        if (active.photos && active.photos.length > 0) {
+          setReceivedPhotos(
+            active.photos.map((p) => ({
+              id: p.id,
+              name: p.file_name,
+              url: p.preview_url || p.file_url || '',
+              size: p.file_size || p.file_size_bytes || 0,
+            }))
+          );
+          setCapturedImage(active.photos[0].preview_url || active.photos[0].file_url || null);
+        } else if (active.photo_url && active.status === 'photo_received') {
+          setReceivedPhotos([
+            {
+              id: 'single_photo',
+              name: 'Classroom Photo',
+              url: active.photo_url,
+              size: active.photo_size_bytes || undefined,
+            },
+          ]);
+          setCapturedImage(active.photo_url);
+        }
+      } else {
+        // Create new session
+        const res = await ApiService.createPhotoUploadSession(session.id, 10);
+        setUploadSession(res.session);
+        setQrDataUrl(res.qr_data_url);
+        setUploadUrl(res.upload_url);
+        setRemainingSeconds(600);
+        setReceivedPhotos([]);
+      }
+    } catch (err: any) {
+      console.error('Failed to initialize photo upload session:', err);
+    } finally {
+      setIsGeneratingQr(false);
+    }
+  }, [session?.id]);
+
+  // Load session when modal opens
+  useEffect(() => {
+    if (isOpen) {
+      setCurrentStep('capture');
+      setCaptureSource('qr');
+      setCapturedImage(null);
+      setReceivedPhotos([]);
+      setScanSummary(null);
+      initOrFetchQrSession();
+    }
+  }, [isOpen, initOrFetchQrSession]);
+
+  // Expiration countdown timer
+  useEffect(() => {
+    if (!isOpen || remainingSeconds <= 0) return;
+    const interval = setInterval(() => {
+      setRemainingSeconds((prev) => {
+        if (prev <= 1) {
+          clearInterval(interval);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [isOpen, remainingSeconds]);
+
+  // Real-time Background Polling for Upload Status
+  useEffect(() => {
+    if (!isOpen || !session?.id) return;
+    if (currentStep !== 'capture' && currentStep !== 'preview') return;
+
+    // Stop polling if photos already received and confirmed
+    if (uploadSession?.status === 'photo_received' && receivedPhotos.length > 0) return;
+
+    const pollInterval = setInterval(async () => {
+      try {
+        const latest = await ApiService.getActivePhotoUploadSession(session.id);
+        if (latest) {
+          if (latest.status === 'photo_received') {
+            const photosList =
+              latest.photos && latest.photos.length > 0
+                ? latest.photos.map((p) => ({
+                    id: p.id,
+                    name: p.file_name,
+                    url: p.preview_url || p.file_url || '',
+                    size: p.file_size || p.file_size_bytes || 0,
+                  }))
+                : latest.photo_url
+                ? [
+                    {
+                      id: 'single_photo',
+                      name: 'Classroom Photo',
+                      url: latest.photo_url,
+                      size: latest.photo_size_bytes || undefined,
+                    },
+                  ]
+                : [];
+
+            if (photosList.length > 0) {
+              setUploadSession(latest);
+              setReceivedPhotos(photosList);
+              setCapturedImage(photosList[0].url);
+              toast.success(
+                photosList.length > 1
+                  ? `${photosList.length} Classroom Photos Received!`
+                  : 'Classroom Photo Received!',
+                'Smartphone upload verified. Ready for face detection and roster matching.'
+              );
+            }
+          } else {
+            setUploadSession(latest);
+          }
+        }
+      } catch (err) {
+        // Silent background polling errors
+      }
+    }, 2000);
+
+    return () => clearInterval(pollInterval);
+  }, [isOpen, session?.id, currentStep, uploadSession?.status, receivedPhotos.length, toast]);
+
+  // Regenerate QR Code
+  const handleRegenerateQr = async () => {
+    setIsGeneratingQr(true);
+    try {
+      const res = await ApiService.createPhotoUploadSession(session.id, 10);
+      setUploadSession(res.session);
+      setQrDataUrl(res.qr_data_url);
+      setUploadUrl(res.upload_url);
+      setRemainingSeconds(600);
+      setCapturedImage(null);
+      setReceivedPhotos([]);
+      toast.info('New QR Code Generated', 'Previous upload session has been invalidated.');
+    } catch (err: any) {
+      toast.error('Regeneration Failed', err.message || 'Could not generate new QR code.');
+    } finally {
+      setIsGeneratingQr(false);
+    }
+  };
+
+  // Revoke QR Session
+  const handleRevokeQr = async () => {
+    setIsRevokingQr(true);
+    try {
+      const res = await ApiService.revokePhotoUploadSession(session.id);
+      if (res) {
+        setUploadSession(res);
+      }
+      toast.info('Session Revoked', 'QR code upload is now deactivated.');
+    } catch (err: any) {
+      toast.error('Revocation Failed', err.message || 'Could not revoke session.');
+    } finally {
+      setIsRevokingQr(false);
+    }
+  };
+
+  // Copy mobile link to clipboard
+  const handleCopyLink = () => {
+    if (!uploadUrl) return;
+    navigator.clipboard.writeText(uploadUrl);
+    setCopiedLink(true);
+    toast.info('Link Copied', 'Mobile upload URL copied to clipboard.');
+    setTimeout(() => setCopiedLink(false), 2000);
+  };
+
+  // -------------------------------------------------------------
+  // Camera Stream Management (Webcam fallback)
+  // -------------------------------------------------------------
+  const startCamera = useCallback(async () => {
+    setCameraError(null);
+    if (stream) {
+      stream.getTracks().forEach((t) => t.stop());
+    }
+
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('Camera access is not supported on this browser/device.');
+      }
+
+      const mediaStream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: facingMode },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+        },
+        audio: false,
+      });
+
+      setStream(mediaStream);
+      if (videoRef.current) {
+        videoRef.current.srcObject = mediaStream;
+      }
+    } catch (err: any) {
+      console.warn('Camera initialization error:', err);
+      let msg = 'Could not access camera. Please check camera permissions or upload a classroom photo.';
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        msg = 'Camera permission was denied. Please allow camera access in browser settings or use file upload.';
+      } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+        msg = 'No camera device found on this system. Please upload a photo instead.';
+      }
+      setCameraError(msg);
+    }
+  }, [facingMode, stream]);
+
+  const stopCamera = useCallback(() => {
+    if (stream) {
+      stream.getTracks().forEach((t) => t.stop());
+      setStream(null);
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+  }, [stream]);
+
+  // Manage webcam stream only when captureSource is 'webcam'
+  useEffect(() => {
+    if (isOpen && currentStep === 'capture' && captureSource === 'webcam' && !capturedImage) {
+      startCamera();
+    } else {
+      stopCamera();
+    }
+    return () => {
+      stopCamera();
+    };
+  }, [isOpen, currentStep, captureSource, capturedImage, startCamera, stopCamera]);
+
+  const toggleFacingMode = () => {
+    setFacingMode((prev) => (prev === 'environment' ? 'user' : 'environment'));
+  };
+
+  const handleCaptureSnapshot = () => {
+    if (!videoRef.current) return;
+    const video = videoRef.current;
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth || 1280;
+    canvas.height = video.videoHeight || 720;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
+    stopCamera();
+    setCapturedImage(dataUrl);
+    setReceivedPhotos([{ id: 'webcam_snapshot', name: 'Webcam Capture', url: dataUrl }]);
+    setCurrentStep('preview');
+  };
+
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (!file.type.startsWith('image/')) {
+      toast.error('Invalid Image', 'Please select a valid image file (JPEG, PNG, WebP)');
+      return;
+    }
+
+    if (file.size > 15 * 1024 * 1024) {
+      toast.error('File Too Large', 'Image exceeds 15MB limit. Please choose a smaller photo.');
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      stopCamera();
+      const url = event.target?.result as string;
+      setCapturedImage(url);
+      setReceivedPhotos([{ id: 'laptop_file', name: file.name, url, size: file.size }]);
+      setCurrentStep('preview');
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleRetake = () => {
+    setCapturedImage(null);
+    setReceivedPhotos([]);
+    setScanSummary(null);
+    setCurrentStep('capture');
+    handleRegenerateQr();
+  };
+
+  // -------------------------------------------------------------
+  // Face Detection & Recognition Processing Pipeline (Multi-Photo)
+  // -------------------------------------------------------------
+  const processClassroomPhoto = async () => {
+    const photosToProcess =
+      receivedPhotos.length > 0
+        ? receivedPhotos
+        : capturedImage
+        ? [{ id: 'captured_single', name: 'Classroom Photo', url: capturedImage }]
+        : [];
+
+    if (photosToProcess.length === 0) return;
+
+    setCurrentStep('processing');
+    setBatchProgress({
+      current: 0,
+      total: photosToProcess.length,
+      percent: 0,
+      photoName: photosToProcess[0].name,
+    });
+
+    try {
+      setProcessingPhase('Initializing neural network models...');
+      await FaceRecognitionService.loadModels();
+
+      setProcessingPhase(
+        `Analyzing classroom photos (${photosToProcess.length} total) for enrolled students...`
+      );
+
+      const summary = await FaceRecognitionService.processMultiPhotoClassroomBatch(
+        photosToProcess,
+        enrolledStudents,
+        session.id,
+        (prog) => {
+          setBatchProgress({
+            current: prog.currentPhoto,
+            total: prog.totalPhotos,
+            percent: prog.percent,
+            photoName: prog.photoName,
+          });
+          setProcessingPhase(
+            `Scanning photo ${prog.currentPhoto} of ${prog.totalPhotos}: ${prog.photoName}...`
+          );
+        }
+      );
+
+      if (summary.totalFacesDetected === 0) {
+        toast.error('No Faces Found', 'No faces detected in the photos. Please capture clearer or closer shots.');
+        setCurrentStep(receivedPhotos.length > 1 ? 'capture' : 'preview');
+        return;
+      }
+
+      setScanSummary(summary);
+
+      // Pre-select all high-confidence matches by default for instructor convenience
+      const initialHighConfIds = new Set<string>();
+      summary.highConfidenceMatches.forEach((m) => {
+        if (m.matchedStudent) initialHighConfIds.add(m.matchedStudent.id);
+      });
+      setSelectedHighConfidenceIds(initialHighConfIds);
+
+      // Clear review choices
+      setResolvedReviewMap(new Map());
+      setManualPresentIds(new Set());
+
+      setCurrentStep('review');
+      setActiveTab(
+        summary.highConfidenceMatches.length > 0
+          ? 'high_confidence'
+          : summary.needsReviewMatches.length > 0
+          ? 'needs_review'
+          : 'not_detected'
+      );
+    } catch (err: any) {
+      console.error('Face processing error:', err);
+      toast.error('Face Scan Failed', err.message || 'Failed to process classroom image.');
+      setCurrentStep('preview');
+    }
+  };
+
+  // -------------------------------------------------------------
+  // Instructor Review Actions
+  // -------------------------------------------------------------
+  const toggleHighConfidenceMatch = (studentId: string) => {
+    setSelectedHighConfidenceIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(studentId)) {
+        next.delete(studentId);
+      } else {
+        next.add(studentId);
+      }
+      return next;
+    });
+  };
+
+  const resolveNeedsReviewMatch = (detectionId: string, chosenStudentId: string) => {
+    setResolvedReviewMap((prev) => {
+      const next = new Map(prev);
+      next.set(detectionId, chosenStudentId);
+      return next;
+    });
+  };
+
+  const toggleManualPresent = (studentId: string) => {
+    setManualPresentIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(studentId)) {
+        next.delete(studentId);
+      } else {
+        next.add(studentId);
+      }
+      return next;
+    });
+  };
+
+  // -------------------------------------------------------------
+  // Attendance Final Confirmation & Submission
+  // -------------------------------------------------------------
+  const handleConfirmAndSubmit = async () => {
+    if (!scanSummary) return;
+
+    setIsSubmitting(true);
+    try {
+      const submissionsMap = new Map<
+        string,
+        {
+          status: 'present';
+          detectionId?: string;
+          confidence?: number;
+          matchType: 'high_confidence' | 'instructor_confirmed' | 'instructor_manual_override';
+        }
+      >();
+
+      // 1. High confidence confirmed matches
+      scanSummary.highConfidenceMatches.forEach((m) => {
+        if (m.matchedStudent && selectedHighConfidenceIds.has(m.matchedStudent.id)) {
+          submissionsMap.set(m.matchedStudent.id, {
+            status: 'present',
+            detectionId: m.detectionId,
+            confidence: m.similarity,
+            matchType: 'high_confidence',
+          });
+        }
+      });
+
+      // 2. Instructor-resolved review matches
+      scanSummary.needsReviewMatches.forEach((m) => {
+        const chosenStudentId = resolvedReviewMap.get(m.detectionId);
+        if (chosenStudentId && chosenStudentId !== 'unknown') {
+          submissionsMap.set(chosenStudentId, {
+            status: 'present',
+            detectionId: m.detectionId,
+            confidence: m.similarity,
+            matchType: 'instructor_confirmed',
+          });
+        }
+      });
+
+      // 3. Manually confirmed not-detected students
+      manualPresentIds.forEach((studentId) => {
+        if (!submissionsMap.has(studentId)) {
+          submissionsMap.set(studentId, {
+            status: 'present',
+            matchType: 'instructor_manual_override',
+          });
+        }
+      });
+
+      const submissionItems = Array.from(submissionsMap.entries()).map(([studentId, meta]) => ({
+        studentId,
+        status: meta.status,
+        detectionId: meta.detectionId,
+        confidenceScore: meta.confidence,
+        matchType: meta.matchType,
+      }));
+
+      if (submissionItems.length === 0) {
+        toast.error('No Selection', 'No students selected for attendance confirmation.');
+        setIsSubmitting(false);
+        return;
+      }
+
+      const res = await ApiService.submitFaceAttendance(session.id, submissionItems);
+
+      toast.success(
+        'Face Attendance Recorded',
+        `${res.markedPresentCount} marked present${
+          res.alreadyPresentCount > 0 ? ` (${res.alreadyPresentCount} already present)` : ''
+        }.`
+      );
+
+      // Clean up memory
+      setCapturedImage(null);
+      setScanSummary(null);
+      stopCamera();
+
+      onAttendanceSubmitted();
+      onClose();
+    } catch (err: any) {
+      console.error('Error submitting face attendance:', err);
+      toast.error('Submission Failed', err.message || 'Failed to submit face attendance.');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const formatSeconds = (sec: number) => {
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return `${m}:${s < 10 ? '0' : ''}${s}`;
+  };
+
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/80 backdrop-blur-sm flex items-center justify-center p-3 sm:p-6 animate-fadeIn">
+      <div className="bg-white rounded-3xl shadow-2xl max-w-4xl w-full max-h-[92vh] flex flex-col overflow-hidden border border-slate-200">
+        {/* Header */}
+        <div className="px-6 py-4 bg-slate-900 text-white flex items-center justify-between shrink-0">
+          <div className="flex items-center gap-3">
+            <div className="p-2.5 rounded-xl bg-brand-500/20 text-brand-400 border border-brand-500/30">
+              <QrCode className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="text-base font-bold text-white flex items-center gap-2">
+                Classroom Photo Attendance
+                <span className="text-[10px] font-semibold uppercase px-2 py-0.5 rounded-full bg-brand-500/30 text-brand-300 border border-brand-500/40">
+                  QR Capture Mode
+                </span>
+              </h3>
+              <p className="text-xs text-slate-300">
+                {session.title} &bull; {session.class_code || 'CS201'} &bull; {enrolledStudents.length} enrolled students
+              </p>
+            </div>
+          </div>
+
+          <button
+            onClick={() => {
+              stopCamera();
+              onClose();
+            }}
+            className="p-2 rounded-xl text-slate-400 hover:text-white hover:bg-white/10 transition cursor-pointer"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        {/* Step 1 & 2: QR Capture View / Upload & Preview */}
+        {(currentStep === 'capture' || currentStep === 'preview') && (
+          <div className="p-6 flex-1 overflow-y-auto space-y-6">
+            {/* Enrollment Status Notice */}
+            <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200 flex items-start gap-3 text-xs text-amber-900">
+              <ShieldAlert className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+              <div>
+                <span className="font-semibold">Roster Enrollment Status: </span>
+                {enrolledWithFaces.length} of {enrolledStudents.length} enrolled students have registered face
+                representations. Students without face references can be manually marked in the review tab.
+              </div>
+            </div>
+
+            {currentStep === 'capture' ? (
+              captureSource === 'qr' ? (
+                /* QR-First Interface */
+                <div className="space-y-6">
+                  {/* Photo Received Card vs QR Waiting Card */}
+                  {(uploadSession?.status === 'photo_received' && (receivedPhotos.length > 0 || capturedImage)) ? (
+                    /* Photo(s) Received State */
+                    <div className="bg-slate-50 border-2 border-emerald-500/30 rounded-3xl p-6 text-center space-y-5 shadow-sm">
+                      <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 text-emerald-700 border border-emerald-500/30 text-xs font-semibold">
+                        <CheckCircle className="w-4 h-4 text-emerald-600" />
+                        {receivedPhotos.length > 1
+                          ? `${receivedPhotos.length} Classroom Photos Received from Phone`
+                          : 'Classroom Photo Received from Phone'}
+                      </div>
+
+                      {receivedPhotos.length > 1 ? (
+                        /* Multi-Photo Grid */
+                        <div className="max-w-2xl mx-auto space-y-2">
+                          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5 max-h-72 overflow-y-auto p-1">
+                            {receivedPhotos.map((p, idx) => (
+                              <div
+                                key={p.id || idx}
+                                className="relative aspect-video rounded-xl overflow-hidden border border-slate-300 shadow-sm bg-black group"
+                              >
+                                <img src={p.url} alt={p.name} className="w-full h-full object-cover" />
+                                <div className="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded bg-black/75 text-[10px] font-mono text-white font-semibold">
+                                  #{idx + 1}
+                                </div>
+                                <div className="absolute bottom-0 inset-x-0 bg-gradient-to-t from-slate-950/90 to-transparent p-1.5 text-left">
+                                  <p className="text-[10px] text-white font-medium truncate">{p.name}</p>
+                                  {p.size && (
+                                    <p className="text-[9px] text-slate-300">
+                                      {(p.size / (1024 * 1024)).toFixed(1)} MB
+                                    </p>
+                                  )}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                          <p className="text-xs text-slate-500 text-center">
+                            Face recognition will scan all {receivedPhotos.length} photos and combine matches into a unified attendance roster.
+                          </p>
+                        </div>
+                      ) : (
+                        /* Single Photo Thumbnail */
+                        <div className="relative max-w-lg mx-auto aspect-video rounded-2xl overflow-hidden border border-slate-300 shadow-md bg-black">
+                          <img
+                            src={capturedImage || (receivedPhotos[0] ? receivedPhotos[0].url : '')}
+                            alt="Received classroom"
+                            className="w-full h-full object-contain"
+                          />
+                          <div className="absolute bottom-0 inset-x-0 bg-gradient-to-t from-slate-950/80 to-transparent p-3 text-left">
+                            <p className="text-xs text-white font-medium flex items-center gap-1.5">
+                              <Smartphone className="w-3.5 h-3.5 text-emerald-400" />
+                              {uploadSession?.photo_device_info || 'Mobile Device'}
+                            </p>
+                            <p className="text-[11px] text-slate-300">
+                              {uploadSession?.photo_size_bytes
+                                ? `${(uploadSession.photo_size_bytes / (1024 * 1024)).toFixed(2)} MB • `
+                                : ''}
+                              Uploaded at {uploadSession?.photo_uploaded_at ? new Date(uploadSession.photo_uploaded_at).toLocaleTimeString() : 'Just now'}
+                            </p>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Actions */}
+                      <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2">
+                        <button
+                          type="button"
+                          onClick={handleRegenerateQr}
+                          disabled={isGeneratingQr}
+                          className="w-full sm:w-auto px-4 py-2.5 rounded-xl border border-slate-300 hover:bg-slate-100 text-slate-700 text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer"
+                        >
+                          <RefreshCw className={`w-4 h-4 ${isGeneratingQr ? 'animate-spin' : ''}`} />
+                          Retake / New QR Code
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={processClassroomPhoto}
+                          className="w-full sm:w-auto px-6 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white text-xs font-bold flex items-center justify-center gap-2 shadow-md transition hover:scale-[1.02] cursor-pointer"
+                        >
+                          <Sparkles className="w-4 h-4" />
+                          {receivedPhotos.length > 1
+                            ? `Proceed to Face Recognition (${receivedPhotos.length} Photos)`
+                            : 'Proceed to Face Recognition'}
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    /* Awaiting QR Scan State */
+                    <div className="grid grid-cols-1 md:grid-cols-12 gap-6 items-center">
+                      {/* Left: Prominent QR Code */}
+                      <div className="md:col-span-5 flex flex-col items-center justify-center p-6 bg-slate-900 rounded-3xl text-white shadow-md border border-slate-800">
+                        {/* Status Badge */}
+                        <div className="mb-4">
+                          {uploadSession?.status === 'uploading' ? (
+                            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30 text-xs font-medium animate-pulse">
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                              Receiving Photo from Phone...
+                            </span>
+                          ) : uploadSession?.status === 'revoked' ? (
+                            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-slate-700 text-slate-300 text-xs font-medium">
+                              <XCircle className="w-3.5 h-3.5" />
+                              Session Revoked
+                            </span>
+                          ) : remainingSeconds <= 0 ? (
+                            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-rose-500/20 text-rose-300 border border-rose-500/30 text-xs font-medium">
+                              <Clock className="w-3.5 h-3.5" />
+                              QR Code Expired
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-brand-500/20 text-brand-300 border border-brand-500/30 text-xs font-medium">
+                              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+                              Awaiting Phone Scan
+                            </span>
+                          )}
+                        </div>
+
+                        {/* QR Code Container */}
+                        <div className="bg-white p-4 rounded-2xl shadow-inner border border-slate-200">
+                          {isGeneratingQr ? (
+                            <div className="w-52 h-52 flex flex-col items-center justify-center text-slate-400">
+                              <Loader2 className="w-8 h-8 animate-spin text-brand-600 mb-2" />
+                              <span className="text-xs">Generating QR...</span>
+                            </div>
+                          ) : qrDataUrl ? (
+                            <img
+                              src={qrDataUrl}
+                              alt="Scan with phone"
+                              className="w-52 h-52 object-contain rounded-lg"
+                            />
+                          ) : (
+                            <div className="w-52 h-52 flex items-center justify-center text-slate-400 text-xs">
+                              No QR Available
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Expiration Timer */}
+                        <div className="mt-4 flex items-center gap-1.5 text-xs text-slate-400">
+                          <Clock className="w-3.5 h-3.5 text-brand-400" />
+                          <span>
+                            Expires in:{' '}
+                            <strong className="text-white font-mono">
+                              {formatSeconds(remainingSeconds)}
+                            </strong>
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Right: Instructions & Controls */}
+                      <div className="md:col-span-7 space-y-4">
+                        <div className="space-y-2">
+                          <h4 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                            <Smartphone className="w-5 h-5 text-brand-600" />
+                            Scan QR Code with Phone
+                          </h4>
+                          <p className="text-xs text-slate-600 leading-relaxed">
+                            No laptop webcam required. Use your smartphone's high-resolution camera to photograph the classroom.
+                          </p>
+                        </div>
+
+                        {/* Step-by-step checklist */}
+                        <div className="space-y-2.5 p-4 rounded-2xl bg-slate-50 border border-slate-200 text-xs text-slate-700">
+                          <div className="flex items-start gap-2.5">
+                            <span className="w-5 h-5 rounded-full bg-brand-100 text-brand-700 font-bold flex items-center justify-center shrink-0 text-[11px]">
+                              1
+                            </span>
+                            <span>Open your phone's default camera app or QR scanner.</span>
+                          </div>
+                          <div className="flex items-start gap-2.5">
+                            <span className="w-5 h-5 rounded-full bg-brand-100 text-brand-700 font-bold flex items-center justify-center shrink-0 text-[11px]">
+                              2
+                            </span>
+                            <span>Point the camera at this QR code and tap the link to open the upload page.</span>
+                          </div>
+                          <div className="flex items-start gap-2.5">
+                            <span className="w-5 h-5 rounded-full bg-brand-100 text-brand-700 font-bold flex items-center justify-center shrink-0 text-[11px]">
+                              3
+                            </span>
+                            <span>Take a clear, wide shot of the classroom and tap <strong>Submit</strong>.</span>
+                          </div>
+                          <div className="flex items-start gap-2.5">
+                            <span className="w-5 h-5 rounded-full bg-brand-100 text-brand-700 font-bold flex items-center justify-center shrink-0 text-[11px]">
+                              4
+                            </span>
+                            <span>This screen will automatically update with the received photo.</span>
+                          </div>
+                        </div>
+
+                        {/* QR Actions */}
+                        <div className="flex flex-wrap items-center gap-2.5 pt-1">
+                          <button
+                            type="button"
+                            onClick={handleRegenerateQr}
+                            disabled={isGeneratingQr}
+                            className="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer"
+                          >
+                            <RefreshCw className={`w-3.5 h-3.5 ${isGeneratingQr ? 'animate-spin' : ''}`} />
+                            Regenerate QR
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={handleCopyLink}
+                            className="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer"
+                          >
+                            {copiedLink ? (
+                              <>
+                                <Check className="w-3.5 h-3.5 text-emerald-600" />
+                                <span className="text-emerald-700">Copied!</span>
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="w-3.5 h-3.5" />
+                                Copy Link
+                              </>
+                            )}
+                          </button>
+
+                          {(uploadSession?.status === 'awaiting_scan' || uploadSession?.status === 'uploading') && (
+                            <button
+                              type="button"
+                              onClick={handleRevokeQr}
+                              disabled={isRevokingQr}
+                              className="px-3 py-2 rounded-xl bg-rose-50 hover:bg-rose-100 text-rose-700 text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer"
+                            >
+                              <XCircle className="w-3.5 h-3.5" />
+                              Revoke
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Fallback Section: Upload from computer or try webcam */}
+                  <div className="p-4 rounded-2xl border border-slate-200 bg-slate-50/50 flex flex-col sm:flex-row items-center justify-between gap-3">
+                    <span className="text-xs text-slate-600">
+                      Already have the photo saved on your computer?
+                    </span>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => fileInputRef.current?.click()}
+                        className="px-3 py-1.5 rounded-xl bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 text-xs font-semibold flex items-center gap-1.5 shadow-sm transition cursor-pointer"
+                      >
+                        <Upload className="w-3.5 h-3.5 text-brand-600" />
+                        Upload File from Laptop
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => setCaptureSource('webcam')}
+                        className="px-3 py-1.5 rounded-xl text-slate-500 hover:text-slate-800 text-xs font-medium transition cursor-pointer"
+                      >
+                        Use Laptop Webcam
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                /* Optional Webcam Viewfinder fallback */
+                <div className="space-y-4">
+                  <div className="relative aspect-video sm:aspect-[16/9] bg-slate-950 rounded-2xl overflow-hidden border border-slate-800 shadow-inner flex items-center justify-center">
+                    {cameraError ? (
+                      <div className="p-6 text-center space-y-3 max-w-md">
+                        <Camera className="w-10 h-10 text-slate-600 mx-auto" />
+                        <p className="text-xs text-slate-300 font-medium">{cameraError}</p>
+                        <div className="flex items-center justify-center gap-2">
+                          <button
+                            onClick={() => setCaptureSource('qr')}
+                            className="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white text-xs font-semibold rounded-xl transition cursor-pointer"
+                          >
+                            Return to Phone QR Code
+                          </button>
+                          <button
+                            onClick={() => fileInputRef.current?.click()}
+                            className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-xl transition cursor-pointer"
+                          >
+                            Upload File Instead
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <>
+                        <video
+                          ref={videoRef}
+                          autoPlay
+                          playsInline
+                          muted
+                          className="w-full h-full object-cover"
+                        />
+
+                        {/* Viewfinder Target Overlay */}
+                        <div className="absolute inset-4 sm:inset-8 border border-white/20 rounded-2xl pointer-events-none flex flex-col justify-between p-4">
+                          <div className="flex justify-between items-start">
+                            <div className="w-6 h-6 border-t-2 border-l-2 border-brand-400" />
+                            <div className="w-6 h-6 border-t-2 border-r-2 border-brand-400" />
+                          </div>
+                          <div className="text-center">
+                            <span className="inline-block px-3 py-1 rounded-full bg-slate-900/70 backdrop-blur-sm text-[11px] text-white border border-white/10 font-medium">
+                              Point webcam at classroom students
+                            </span>
+                          </div>
+                          <div className="flex justify-between items-end">
+                            <div className="w-6 h-6 border-b-2 border-l-2 border-brand-400" />
+                            <div className="w-6 h-6 border-b-2 border-r-2 border-brand-400" />
+                          </div>
+                        </div>
+
+                        {/* Camera Controls Overlay */}
+                        <div className="absolute bottom-4 left-4 right-4 flex items-center justify-between">
+                          <button
+                            type="button"
+                            onClick={toggleFacingMode}
+                            className="p-3 rounded-full bg-slate-900/80 hover:bg-slate-900 text-white backdrop-blur-md border border-white/20 transition cursor-pointer"
+                            title="Switch camera"
+                          >
+                            <FlipHorizontal className="w-5 h-5" />
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={handleCaptureSnapshot}
+                            className="px-6 py-3.5 rounded-full bg-brand-600 hover:bg-brand-500 text-white font-bold text-sm shadow-xl flex items-center gap-2 transition hover:scale-105 active:scale-95 cursor-pointer"
+                          >
+                            <Camera className="w-5 h-5" />
+                            Capture Photo
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => setCaptureSource('qr')}
+                            className="p-3 rounded-full bg-slate-900/80 hover:bg-slate-900 text-white backdrop-blur-md border border-white/20 transition cursor-pointer"
+                            title="Return to Phone QR Code"
+                          >
+                            <QrCode className="w-5 h-5" />
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </div>
+
+                  <div className="flex items-center justify-between pt-1">
+                    <button
+                      type="button"
+                      onClick={() => setCaptureSource('qr')}
+                      className="text-xs font-semibold text-brand-600 hover:text-brand-700 flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <ArrowLeft className="w-3.5 h-3.5" />
+                      Back to Phone QR Code
+                    </button>
+                  </div>
+                </div>
+              )
+            ) : (
+              /* Preview Captured / Uploaded Image */
+              <div className="space-y-4">
+                <div className="relative aspect-video sm:aspect-[16/9] bg-slate-950 rounded-2xl overflow-hidden border border-slate-200 shadow-md">
+                  <img
+                    src={capturedImage!}
+                    alt="Classroom preview"
+                    className="w-full h-full object-contain"
+                  />
+                  <div className="absolute top-4 left-4">
+                    <span className="px-3 py-1 rounded-full bg-slate-900/80 backdrop-blur-sm text-[11px] font-semibold text-white border border-white/10">
+                      Classroom Photo Preview
+                    </span>
+                  </div>
+                </div>
+
+                <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-2">
+                  <button
+                    type="button"
+                    onClick={handleRetake}
+                    className="w-full sm:w-auto px-4 py-2.5 rounded-xl border border-slate-300 hover:bg-slate-50 text-slate-700 text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer"
+                  >
+                    <RefreshCw className="w-4 h-4" />
+                    Retake / Choose Another
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={processClassroomPhoto}
+                    className="w-full sm:w-auto px-6 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-xs font-bold flex items-center justify-center gap-2 shadow-sm transition hover:scale-[1.02] active:scale-[0.98] cursor-pointer"
+                  >
+                    <Sparkles className="w-4 h-4" />
+                    Process Faces &amp; Match Roster
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/jpeg,image/png,image/webp"
+              className="hidden"
+              onChange={handleFileUpload}
+            />
+          </div>
+        )}
+
+        {/* Step 3: Neural Processing State */}
+        {currentStep === 'processing' && (
+          <div className="p-12 flex-1 flex flex-col items-center justify-center space-y-4 text-center">
+            <div className="relative">
+              <div className="w-16 h-16 rounded-full bg-brand-50 border-2 border-brand-200 flex items-center justify-center text-brand-600">
+                <Loader2 className="w-8 h-8 animate-spin" />
+              </div>
+              <Sparkles className="w-5 h-5 text-amber-500 absolute -top-1 -right-1 animate-pulse" />
+            </div>
+
+            <div className="space-y-1 max-w-sm">
+              <h4 className="text-sm font-bold text-slate-800">
+                {batchProgress && batchProgress.total > 1
+                  ? `Processing Photos (${batchProgress.current}/${batchProgress.total})`
+                  : 'Processing Classroom Photo'}
+              </h4>
+              <p className="text-xs text-slate-500 font-medium">{processingPhase}</p>
+            </div>
+
+            {batchProgress && batchProgress.total > 1 && (
+              <div className="w-full max-w-xs space-y-1.5 pt-1">
+                <div className="flex justify-between text-[11px] text-slate-500 font-mono">
+                  <span>Batch Progress</span>
+                  <span>{batchProgress.percent}%</span>
+                </div>
+                <div className="w-full h-2 rounded-full bg-slate-100 overflow-hidden border border-slate-200">
+                  <div
+                    className="h-full bg-brand-600 transition-all duration-300"
+                    style={{ width: `${batchProgress.percent}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
+            <p className="text-[11px] text-slate-400 max-w-xs">
+              Running SSD MobileNet face detection and ResNet-34 128-d Euclidean roster matching...
+            </p>
+          </div>
+        )}
+
+        {/* Step 4: Results & Review Screen (3 Categories) */}
+        {currentStep === 'review' && scanSummary && (
+          <div className="flex-1 flex flex-col min-h-0">
+            {/* Summary Bar */}
+            <div className="px-6 py-3 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3 shrink-0 text-xs">
+              <div className="flex items-center gap-2 font-medium text-slate-700">
+                <Users className="w-4 h-4 text-brand-600" />
+                <span>
+                  Detected <strong className="text-slate-900">{scanSummary.totalFacesDetected}</strong> visible
+                  faces {receivedPhotos.length > 1 ? `across ${receivedPhotos.length} classroom photos` : 'in classroom photo'}
+                </span>
+              </div>
+
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={handleRetake}
+                  className="px-3 py-1 rounded-lg border border-slate-200 hover:bg-white text-slate-600 text-xs flex items-center gap-1.5 transition cursor-pointer"
+                >
+                  <ArrowLeft className="w-3.5 h-3.5" />
+                  New Photo
+                </button>
+              </div>
+            </div>
+
+            {/* Tab Navigation */}
+            <div className="px-6 pt-3 bg-white border-b border-slate-200 shrink-0">
+              <div className="flex space-x-2">
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('high_confidence')}
+                  className={`pb-3 px-3 text-xs font-bold border-b-2 transition flex items-center gap-1.5 cursor-pointer ${
+                    activeTab === 'high_confidence'
+                      ? 'border-emerald-600 text-emerald-700'
+                      : 'border-transparent text-slate-500 hover:text-slate-800'
+                  }`}
+                >
+                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                  High Confidence ({scanSummary.highConfidenceMatches.length})
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('needs_review')}
+                  className={`pb-3 px-3 text-xs font-bold border-b-2 transition flex items-center gap-1.5 cursor-pointer ${
+                    activeTab === 'needs_review'
+                      ? 'border-amber-600 text-amber-700'
+                      : 'border-transparent text-slate-500 hover:text-slate-800'
+                  }`}
+                >
+                  <HelpCircle className="w-3.5 h-3.5 text-amber-600" />
+                  Needs Review ({scanSummary.needsReviewMatches.length})
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('not_detected')}
+                  className={`pb-3 px-3 text-xs font-bold border-b-2 transition flex items-center gap-1.5 cursor-pointer ${
+                    activeTab === 'not_detected'
+                      ? 'border-slate-800 text-slate-800'
+                      : 'border-transparent text-slate-500 hover:text-slate-800'
+                  }`}
+                >
+                  <UserX className="w-3.5 h-3.5 text-slate-500" />
+                  Unknown &amp; Not Detected ({scanSummary.unknownFaces.length + scanSummary.notDetectedEnrolledStudents.length})
+                </button>
+              </div>
+            </div>
+
+            {/* Tab Content */}
+            <div className="p-6 flex-1 overflow-y-auto space-y-4">
+              {/* TAB 1: High Confidence Matches */}
+              {activeTab === 'high_confidence' && (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between text-xs text-slate-500">
+                    <p>
+                      Matches where Euclidean distance &le; 0.45. Verified candidates proposed for Present status:
+                    </p>
+                    <span className="font-semibold text-slate-700">
+                      {selectedHighConfidenceIds.size} of {scanSummary.highConfidenceMatches.length} selected
+                    </span>
+                  </div>
+
+                  {scanSummary.highConfidenceMatches.length === 0 ? (
+                    <div className="p-8 text-center text-xs text-slate-500 bg-slate-50 rounded-2xl border border-slate-200">
+                      No high-confidence matches found. Check the "Needs Review" tab for ambiguous candidates.
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      {scanSummary.highConfidenceMatches.map((match) => {
+                        const student = match.matchedStudent!;
+                        const isSelected = selectedHighConfidenceIds.has(student.id);
+
+                        return (
+                          <div
+                            key={match.detectionId}
+                            onClick={() => toggleHighConfidenceMatch(student.id)}
+                            className={`p-3.5 rounded-2xl border transition cursor-pointer flex items-center gap-3.5 ${
+                              isSelected
+                                ? 'bg-emerald-50/60 border-emerald-300 ring-1 ring-emerald-400'
+                                : 'bg-white border-slate-200 opacity-60 hover:opacity-100'
+                            }`}
+                          >
+                            {/* Comparison: Detected Face Crop vs Registered Photo */}
+                            <div className="relative shrink-0 flex items-center -space-x-2">
+                              {match.cropUrl ? (
+                                <img
+                                  src={match.cropUrl}
+                                  alt="Detected face crop"
+                                  className="w-12 h-12 rounded-full object-cover border-2 border-white shadow-sm"
+                                  title="Detected Face in Classroom Photo"
+                                />
+                              ) : (
+                                <div className="w-12 h-12 rounded-full bg-slate-200 flex items-center justify-center text-slate-500">
+                                  <ImageIcon className="w-5 h-5" />
+                                </div>
+                              )}
+
+                              {student.photo_url || student.photo_path ? (
+                                <img
+                                  src={student.photo_url || student.photo_path}
+                                  alt={student.full_name}
+                                  className="w-12 h-12 rounded-full object-cover border-2 border-white shadow-sm"
+                                  title="Enrolled Student Reference Photo"
+                                />
+                              ) : (
+                                <div className="w-12 h-12 rounded-full bg-brand-100 text-brand-700 flex items-center justify-center font-bold text-xs border-2 border-white">
+                                  {student.full_name.charAt(0)}
+                                </div>
+                              )}
+                            </div>
+
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center justify-between">
+                                <h5 className="text-xs font-bold text-slate-800 truncate">
+                                  {student.full_name}
+                                </h5>
+                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 font-semibold">
+                                  {match.similarity !== undefined ? (match.similarity * 100).toFixed(0) : '0'}% match
+                                </span>
+                              </div>
+                              <p className="text-[11px] text-slate-500 font-mono">{student.roll_number}</p>
+                              <div className="text-[10px] text-slate-400 mt-0.5 flex flex-wrap items-center gap-1.5">
+                                <span>Distance: {match.distance !== undefined ? match.distance.toFixed(3) : 'N/A'}</span>
+                                {match.sourcePhotoName && (
+                                  <span className="inline-flex items-center gap-1 text-[9px] text-brand-600 bg-brand-50 px-1.5 py-0.2 rounded border border-brand-200">
+                                    <Layers className="w-2.5 h-2.5" />
+                                    {match.sourcePhotoName}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+
+                            <div
+                              className={`w-6 h-6 rounded-full flex items-center justify-center transition shrink-0 ${
+                                isSelected
+                                  ? 'bg-emerald-600 text-white'
+                                  : 'border-2 border-slate-300 text-transparent'
+                              }`}
+                            >
+                              <Check className="w-3.5 h-3.5" />
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* TAB 2: Needs Review Matches */}
+              {activeTab === 'needs_review' && (
+                <div className="space-y-4">
+                  <p className="text-xs text-slate-500">
+                    Matches with distance between 0.45 and 0.60. Please manually verify candidate identity:
+                  </p>
+
+                  {scanSummary.needsReviewMatches.length === 0 ? (
+                    <div className="p-8 text-center text-xs text-slate-500 bg-slate-50 rounded-2xl border border-slate-200">
+                      No ambiguous matches. All detected faces were either high-confidence or unknown.
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      {scanSummary.needsReviewMatches.map((match) => {
+                        const resolvedId = resolvedReviewMap.get(match.detectionId);
+
+                        return (
+                          <div
+                            key={match.detectionId}
+                            className="p-4 rounded-2xl border border-amber-200 bg-amber-50/40 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4"
+                          >
+                            <div className="flex items-center gap-3">
+                              {match.cropUrl ? (
+                                <img
+                                  src={match.cropUrl}
+                                  alt="Candidate face crop"
+                                  className="w-14 h-14 rounded-2xl object-cover border-2 border-amber-300 shadow-sm shrink-0"
+                                />
+                              ) : (
+                                <div className="w-14 h-14 rounded-2xl bg-amber-100 flex items-center justify-center text-amber-700 shrink-0">
+                                  <ImageIcon className="w-6 h-6" />
+                                </div>
+                              )}
+
+                              <div>
+                                <span className="text-[10px] uppercase font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-full">
+                                  Ambiguous Candidate (Distance: {match.distance !== undefined ? match.distance.toFixed(3) : 'N/A'})
+                                </span>
+                                <p className="text-xs font-semibold text-slate-800 mt-1">
+                                  Suggested: {match.matchedStudent?.full_name || 'Unknown Student'}
+                                </p>
+                                <p className="text-[11px] text-slate-500 font-mono">
+                                  {match.matchedStudent?.roll_number} &bull; {match.similarity !== undefined ? (match.similarity * 100).toFixed(0) : '0'}% resemblance
+                                </p>
+                                {match.sourcePhotoName && (
+                                  <span className="inline-flex items-center gap-1 text-[10px] text-amber-800 bg-amber-100/90 px-1.5 py-0.5 rounded border border-amber-200 mt-1">
+                                    <Layers className="w-3 h-3" />
+                                    Photo: {match.sourcePhotoName}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+
+                            <div className="flex items-center gap-2 w-full sm:w-auto">
+                              {match.matchedStudent && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    resolveNeedsReviewMatch(
+                                      match.detectionId,
+                                      resolvedId === match.matchedStudent!.id ? '' : match.matchedStudent!.id
+                                    )
+                                  }
+                                  className={`flex-1 sm:flex-none px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                                    resolvedId === match.matchedStudent.id
+                                      ? 'bg-emerald-600 text-white shadow-sm'
+                                      : 'bg-white border border-slate-300 text-slate-700 hover:bg-slate-50'
+                                  }`}
+                                >
+                                  <Check className="w-3.5 h-3.5" />
+                                  Confirm as {match.matchedStudent.full_name.split(' ')[0]}
+                                </button>
+                              )}
+
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  resolveNeedsReviewMatch(
+                                    match.detectionId,
+                                    resolvedId === 'unknown' ? '' : 'unknown'
+                                  )
+                                }
+                                className={`flex-1 sm:flex-none px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                                  resolvedId === 'unknown'
+                                    ? 'bg-slate-800 text-white'
+                                    : 'bg-white border border-slate-300 text-slate-700 hover:bg-slate-50'
+                                }`}
+                              >
+                                Mark as Unknown
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* TAB 3: Unknown Faces & Not Detected Enrolled Students */}
+              {activeTab === 'not_detected' && (
+                <div className="space-y-6">
+                  {/* Unknown Faces in image */}
+                  <div>
+                    <h5 className="text-xs font-bold text-slate-700 mb-2 flex items-center gap-2">
+                      <HelpCircle className="w-4 h-4 text-slate-400" />
+                      Unrecognized Faces in Photo ({scanSummary.unknownFaces.length})
+                    </h5>
+
+                    {scanSummary.unknownFaces.length === 0 ? (
+                      <p className="text-xs text-slate-400 italic">No unknown faces detected in photo.</p>
+                    ) : (
+                      <div className="flex flex-wrap gap-2.5">
+                        {scanSummary.unknownFaces.map((face) => (
+                          <div
+                            key={face.detectionId}
+                            className="p-2 rounded-xl bg-slate-50 border border-slate-200 flex items-center gap-2"
+                          >
+                            {face.cropUrl ? (
+                              <img
+                                src={face.cropUrl}
+                                alt="Unknown face"
+                                className="w-10 h-10 rounded-lg object-cover"
+                              />
+                            ) : (
+                              <div className="w-10 h-10 rounded-lg bg-slate-200 flex items-center justify-center text-slate-500">
+                                <ImageIcon className="w-4 h-4" />
+                              </div>
+                            )}
+                            <div className="text-[11px]">
+                              <p className="font-semibold text-slate-700">Unrecognized</p>
+                              <p className="text-slate-400">Score: {face.similarity !== undefined ? (face.similarity * 100).toFixed(0) : '0'}%</p>
+                              {face.sourcePhotoName && (
+                                <p className="text-[9px] text-slate-400 truncate max-w-[110px]">
+                                  {face.sourcePhotoName}
+                                </p>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Enrolled Students Not Detected in Photo */}
+                  <div>
+                    <h5 className="text-xs font-bold text-slate-700 mb-2 flex items-center gap-2">
+                      <UserX className="w-4 h-4 text-slate-400" />
+                      Enrolled Students Not Detected ({scanSummary.notDetectedEnrolledStudents.length})
+                    </h5>
+
+                    <p className="text-xs text-slate-500 mb-3">
+                      Select students who are present in the classroom to manually confirm their attendance:
+                    </p>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      {scanSummary.notDetectedEnrolledStudents.map((student) => {
+                        const isManuallyPresent = manualPresentIds.has(student.id);
+
+                        return (
+                          <div
+                            key={student.id}
+                            onClick={() => toggleManualPresent(student.id)}
+                            className={`p-3 rounded-xl border transition cursor-pointer flex items-center justify-between ${
+                              isManuallyPresent
+                                ? 'bg-emerald-50/60 border-emerald-300'
+                                : 'bg-white border-slate-200 hover:bg-slate-50'
+                            }`}
+                          >
+                            <div className="flex items-center gap-2.5 min-w-0">
+                              {student.photo_url || student.photo_path ? (
+                                <img
+                                  src={student.photo_url || student.photo_path}
+                                  alt={student.full_name}
+                                  className="w-8 h-8 rounded-full object-cover shrink-0"
+                                />
+                              ) : (
+                                <div className="w-8 h-8 rounded-full bg-slate-100 text-slate-600 flex items-center justify-center font-bold text-xs shrink-0">
+                                  {student.full_name.charAt(0)}
+                                </div>
+                              )}
+                              <div className="truncate">
+                                <p className="text-xs font-semibold text-slate-800 truncate">
+                                  {student.full_name}
+                                </p>
+                                <p className="text-[10px] text-slate-400 font-mono">
+                                  {student.roll_number}
+                                  {!student.face_descriptor && (
+                                    <span className="text-amber-600 font-sans ml-1">(No registered face)</span>
+                                  )}
+                                </p>
+                              </div>
+                            </div>
+
+                            <button
+                              type="button"
+                              className={`px-2 py-1 rounded-lg text-[10px] font-bold transition shrink-0 cursor-pointer ${
+                                isManuallyPresent
+                                  ? 'bg-emerald-600 text-white'
+                                  : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                              }`}
+                            >
+                              {isManuallyPresent ? 'Present' : 'Mark Present'}
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Bottom Actions Footer */}
+            <div className="px-6 py-4 bg-slate-50 border-t border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-3 shrink-0">
+              <div className="text-xs text-slate-600">
+                Confirming attendance for{' '}
+                <strong className="text-slate-900 font-bold">
+                  {selectedHighConfidenceIds.size +
+                    Array.from(resolvedReviewMap.values()).filter((v) => v && v !== 'unknown').length +
+                    manualPresentIds.size}
+                </strong>{' '}
+                students.
+              </div>
+
+              <div className="flex items-center gap-3 w-full sm:w-auto">
+                <button
+                  type="button"
+                  onClick={() => {
+                    stopCamera();
+                    onClose();
+                  }}
+                  className="w-full sm:w-auto px-4 py-2.5 rounded-xl border border-slate-300 hover:bg-white text-slate-700 text-xs font-semibold transition cursor-pointer"
+                >
+                  Cancel
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleConfirmAndSubmit}
+                  disabled={isSubmitting}
+                  className="w-full sm:w-auto px-6 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 disabled:opacity-50 text-white text-xs font-bold flex items-center justify-center gap-2 shadow-sm transition hover:scale-[1.02] cursor-pointer"
+                >
+                  {isSubmitting ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      Saving Attendance Records...
+                    </>
+                  ) : (
+                    <>
+                      <CheckCircle2 className="w-4 h-4" />
+                      Confirm &amp; Update Attendance Records
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
