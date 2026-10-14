@@ -8,8 +8,9 @@ import {
   RefreshCw,
   Camera,
   Loader2,
+  Layers,
 } from 'lucide-react';
-import type { Student, ClassCourse, FaceEnrollmentStatus } from '../../types';
+import type { Student, ClassCourse, FaceEnrollmentStatus, AcademicSection } from '../../types';
 import { validatePhotoFile } from '../../services/storage';
 import { ApiService } from '../../services/api';
 import { FaceRecognitionService } from '../../services/faceRecognition';
@@ -18,7 +19,7 @@ interface StudentFormModalProps {
   isOpen: boolean;
   onClose: () => void;
   onSubmit: (
-    data: Omit<Student, 'id' | 'instructor_id' | 'created_at' | 'updated_at'> & { class_id?: string },
+    data: Omit<Student, 'id' | 'instructor_id' | 'created_at' | 'updated_at'> & { class_id?: string; section_id?: string },
     photoFile?: File,
     onProgress?: (pct: number) => void
   ) => Promise<void>;
@@ -39,6 +40,11 @@ export const StudentFormModal: React.FC<StudentFormModalProps> = ({
   const [academicYear, setAcademicYear] = useState('Year 2');
   const [section, setSection] = useState('Section A');
   const [isActive, setIsActive] = useState(true);
+
+  // Section Assignment
+  const [sections, setSections] = useState<AcademicSection[]>([]);
+  const [selectedSectionId, setSelectedSectionId] = useState<string>('');
+  const [isCustomSection, setIsCustomSection] = useState(false);
 
   // Class enrollment assignment
   const [classes, setClasses] = useState<ClassCourse[]>([]);
@@ -61,9 +67,13 @@ export const StudentFormModal: React.FC<StudentFormModalProps> = ({
 
   useEffect(() => {
     if (isOpen) {
-      ApiService.getClasses()
-        .then((data) => setClasses(data || []))
-        .catch(() => setClasses([]));
+      Promise.all([
+        ApiService.getClasses().catch(() => []),
+        ApiService.getSections().catch(() => []),
+      ]).then(([clsData, secData]) => {
+        setClasses(clsData || []);
+        setSections(secData || []);
+      });
     }
   }, [isOpen]);
 
@@ -85,6 +95,13 @@ export const StudentFormModal: React.FC<StudentFormModalProps> = ({
       setFaceStatusMessage(studentToEdit.face_descriptor ? 'Face biometrics enrolled' : '');
       setPhotoFile(null);
       setSelectedClassId('');
+      if (studentToEdit.section_id) {
+        setSelectedSectionId(studentToEdit.section_id);
+        setIsCustomSection(false);
+      } else {
+        setSelectedSectionId('');
+        setIsCustomSection(true);
+      }
 
       // Fetch student's current class enrollment
       ApiService.getStudentEnrollments(studentToEdit.id)
@@ -99,10 +116,10 @@ export const StudentFormModal: React.FC<StudentFormModalProps> = ({
       setFullName('');
       setRollNumber('');
       setEmail('');
-      setCourse('B.Tech Computer Science');
-      setBatch('Batch 2024-2028');
-      setAcademicYear('Year 2');
-      setSection('Section A');
+      setCourse('B.Tech Software Engineering');
+      setBatch('2024-2028');
+      setAcademicYear('2026-2027');
+      setSection('A');
       setIsActive(true);
       setExistingPhotoPath('');
       setPhotoPreview('');
@@ -112,10 +129,37 @@ export const StudentFormModal: React.FC<StudentFormModalProps> = ({
       setFaceStatusMessage('');
       setPhotoFile(null);
       setSelectedClassId('');
+      setIsCustomSection(false);
+      if (sections.length > 0) {
+        setSelectedSectionId(sections[0].id);
+        setCourse(sections[0].programme);
+        setBatch(sections[0].batch);
+        setAcademicYear(sections[0].academic_year);
+        setSection(sections[0].section);
+      } else {
+        setSelectedSectionId('');
+      }
     }
     setErrorMessage('');
     setUploadProgress(0);
-  }, [studentToEdit, isOpen]);
+  }, [studentToEdit, isOpen, sections]);
+
+  const handleSectionSelect = (secId: string) => {
+    if (secId === 'custom') {
+      setIsCustomSection(true);
+      setSelectedSectionId('');
+    } else {
+      setIsCustomSection(false);
+      setSelectedSectionId(secId);
+      const s = sections.find((sec) => sec.id === secId);
+      if (s) {
+        setCourse(s.programme);
+        setBatch(s.batch);
+        setAcademicYear(s.academic_year);
+        setSection(s.section);
+      }
+    }
+  };
 
   const handleClassSelect = (classId: string) => {
     setSelectedClassId(classId);
@@ -254,6 +298,7 @@ export const StudentFormModal: React.FC<StudentFormModalProps> = ({
           face_enrollment_status: faceStatus,
           face_quality_score: faceQualityScore,
           class_id: selectedClassId || undefined,
+          section_id: selectedSectionId || undefined,
         },
         photoFile || undefined,
         (pct) => setUploadProgress(pct)
@@ -444,104 +489,124 @@ export const StudentFormModal: React.FC<StudentFormModalProps> = ({
             </div>
           </div>
 
-          {/* Section 3: Academic Details & Class Assignment */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div className="sm:col-span-2">
-              <label className="block text-xs font-semibold text-slate-700 mb-1.5">
-                Assign to Class / Course <span className="text-slate-400 font-normal">(Enrolls student for attendance)</span>
+          {/* Section 3: Academic Details & Institutional Section */}
+          <div className="p-4 bg-slate-50/80 rounded-2xl border border-slate-200/80 space-y-3.5">
+            <div className="flex items-center justify-between">
+              <label className="block text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                <Layers className="w-4 h-4 text-brand-600" />
+                Institutional Academic Section
+              </label>
+              <button
+                type="button"
+                onClick={() => setIsCustomSection(!isCustomSection)}
+                className="text-[11px] font-semibold text-brand-600 hover:text-brand-700 underline cursor-pointer"
+              >
+                {isCustomSection ? 'Select Existing Section' : '+ New Academic Section'}
+              </button>
+            </div>
+
+            {!isCustomSection && sections.length > 0 ? (
+              <div>
+                <select
+                  value={selectedSectionId}
+                  onChange={(e) => handleSectionSelect(e.target.value)}
+                  disabled={isSubmitting}
+                  className="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-xs font-medium focus:outline-none focus:ring-2 focus:ring-brand-500/20"
+                >
+                  {sections.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.programme} &bull; Batch {s.batch} &bull; Sec {s.section} ({s.academic_year})
+                    </option>
+                  ))}
+                  <option value="custom">+ Create New Custom Section...</option>
+                </select>
+                <p className="text-[11px] text-emerald-700 mt-1.5 flex items-center gap-1 font-medium">
+                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                  Automatically enrolled in all courses matching Section {section} ({course}).
+                </p>
+              </div>
+            ) : null}
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  Programme / Course <span className="text-rose-500">*</span>
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={course}
+                  onChange={(e) => handleCourseChange(e.target.value)}
+                  placeholder="e.g. B.Tech Software Engineering"
+                  disabled={isSubmitting || (!isCustomSection && sections.length > 0)}
+                  className="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-brand-500/20 disabled:bg-slate-100 disabled:text-slate-600"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  Batch Cohort <span className="text-rose-500">*</span>
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={batch}
+                  onChange={(e) => setBatch(e.target.value)}
+                  placeholder="e.g. 2024-2028"
+                  disabled={isSubmitting || (!isCustomSection && sections.length > 0)}
+                  className="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-brand-500/20 disabled:bg-slate-100 disabled:text-slate-600"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  Academic Year <span className="text-rose-500">*</span>
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={academicYear}
+                  onChange={(e) => setAcademicYear(e.target.value)}
+                  placeholder="e.g. 2026-2027"
+                  disabled={isSubmitting || (!isCustomSection && sections.length > 0)}
+                  className="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-brand-500/20 disabled:bg-slate-100 disabled:text-slate-600"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  Section <span className="text-rose-500">*</span>
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={section}
+                  onChange={(e) => setSection(e.target.value)}
+                  placeholder="e.g. A"
+                  disabled={isSubmitting || (!isCustomSection && sections.length > 0)}
+                  className="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-xs uppercase font-bold text-brand-700 focus:outline-none focus:ring-2 focus:ring-brand-500/20 disabled:bg-slate-100"
+                />
+              </div>
+            </div>
+
+            {/* Optional Specific Class / Elective Assignment */}
+            <div className="pt-2 border-t border-slate-200/70">
+              <label className="block text-xs font-semibold text-slate-700 mb-1">
+                Optional Elective / Specific Class Assignment
               </label>
               <select
                 value={selectedClassId}
                 onChange={(e) => handleClassSelect(e.target.value)}
                 disabled={isSubmitting}
-                className="w-full px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500 transition"
+                className="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-brand-500/20"
               >
-                <option value="">-- None (Directory Only / Unassigned) --</option>
+                <option value="">-- Standard Section Membership (Auto-enrolled in all section classes) --</option>
                 {classes.map((c) => (
                   <option key={c.id} value={c.id}>
-                    {c.name} ({c.code} - Sec {c.section})
+                    {c.name} ({c.code} - Sec {c.section}) [Manual / Elective]
                   </option>
                 ))}
               </select>
-              {selectedClassId ? (
-                <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-emerald-700 font-medium">
-                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                  <span>
-                    Student will be enrolled in{' '}
-                    <strong>{classes.find((c) => c.id === selectedClassId)?.name}</strong> and appear on its attendance roster.
-                  </span>
-                </div>
-              ) : (
-                <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-amber-700 font-medium">
-                  <AlertCircle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
-                  <span>
-                    No class assigned: Student will remain in the directory only and will not appear in lecture attendance sessions until enrolled.
-                  </span>
-                </div>
-              )}
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1.5">
-                Course / Programme <span className="text-rose-500">*</span>
-              </label>
-              <input
-                type="text"
-                required
-                value={course}
-                onChange={(e) => handleCourseChange(e.target.value)}
-                placeholder="e.g. B.Tech Computer Science"
-                disabled={isSubmitting}
-                className="w-full px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500 transition"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1.5">
-                Batch / Class <span className="text-rose-500">*</span>
-              </label>
-              <input
-                type="text"
-                required
-                value={batch}
-                onChange={(e) => setBatch(e.target.value)}
-                placeholder="e.g. Batch 2024-2028"
-                disabled={isSubmitting}
-                className="w-full px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500 transition"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1.5">
-                Academic Year <span className="text-rose-500">*</span>
-              </label>
-              <select
-                value={academicYear}
-                onChange={(e) => setAcademicYear(e.target.value)}
-                disabled={isSubmitting}
-                className="w-full px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500 transition"
-              >
-                <option value="Year 1">Year 1 (Freshman)</option>
-                <option value="Year 2">Year 2 (Sophomore)</option>
-                <option value="Year 3">Year 3 (Junior)</option>
-                <option value="Year 4">Year 4 (Senior)</option>
-                <option value="Postgraduate">Postgraduate</option>
-              </select>
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1.5">
-                Section <span className="text-rose-500">*</span>
-              </label>
-              <input
-                type="text"
-                required
-                value={section}
-                onChange={(e) => setSection(e.target.value)}
-                placeholder="e.g. Section A"
-                disabled={isSubmitting}
-                className="w-full px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500 transition"
-              />
             </div>
           </div>
 

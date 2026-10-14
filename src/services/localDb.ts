@@ -3,6 +3,7 @@ import type {
   Student,
   ClassCourse,
   ClassEnrollment,
+  AcademicSection,
   AttendanceSession,
   AttendanceRecord,
   AttendanceAuditLog,
@@ -33,6 +34,7 @@ import QRCode from 'qrcode';
 const STORAGE_KEYS = {
   CURRENT_USER: 'sentinel_campus_current_instructor',
   INSTRUCTORS: 'sentinel_campus_instructors',
+  SECTIONS: 'sentinel_campus_academic_sections',
   STUDENTS: 'sentinel_campus_students',
   CLASSES: 'sentinel_campus_classes',
   ENROLLMENTS: 'sentinel_campus_enrollments',
@@ -143,6 +145,203 @@ export class LocalDatabase {
   }
 
   // -------------------------------------------------------------
+  // Academic Sections (Institutional Cohorts)
+  // -------------------------------------------------------------
+  static getSections(filters?: {
+    programme?: string;
+    batch?: string;
+    academic_year?: string;
+    is_active?: boolean | null;
+  }): AcademicSection[] {
+    const instructor = this.getCurrentInstructor();
+    if (!instructor) return [];
+
+    let sections = loadData<AcademicSection[]>(STORAGE_KEYS.SECTIONS, []);
+    sections = sections.filter((sec) => sec.instructor_id === instructor.id);
+
+    if (filters?.is_active !== undefined && filters?.is_active !== null) {
+      sections = sections.filter((sec) => sec.is_active === filters.is_active);
+    }
+    if (filters?.programme) {
+      sections = sections.filter((sec) => sec.programme.toLowerCase() === filters.programme!.toLowerCase());
+    }
+    if (filters?.batch) {
+      sections = sections.filter((sec) => sec.batch.toLowerCase() === filters.batch!.toLowerCase());
+    }
+    if (filters?.academic_year) {
+      sections = sections.filter((sec) => sec.academic_year === filters.academic_year);
+    }
+
+    // Attach real student count
+    const students = loadData<Student[]>(STORAGE_KEYS.STUDENTS, []).filter(
+      (s) => s.instructor_id === instructor.id && s.is_active
+    );
+
+    return sections
+      .map((sec) => ({
+        ...sec,
+        student_count: students.filter((s) => s.section_id === sec.id).length,
+      }))
+      .sort((a, b) => a.programme.localeCompare(b.programme) || (a.name || '').localeCompare(b.name || ''));
+  }
+
+  static getSectionById(id: string): AcademicSection | null {
+    const instructor = this.getCurrentInstructor();
+    if (!instructor) return null;
+    const sections = loadData<AcademicSection[]>(STORAGE_KEYS.SECTIONS, []);
+    const found = sections.find((s) => s.id === id && s.instructor_id === instructor.id);
+    if (!found) return null;
+
+    const students = loadData<Student[]>(STORAGE_KEYS.STUDENTS, []).filter(
+      (s) => s.instructor_id === instructor.id && s.is_active && s.section_id === found.id
+    );
+    return {
+      ...found,
+      student_count: students.length,
+    };
+  }
+
+  static createSection(
+    data: Omit<AcademicSection, 'id' | 'instructor_id' | 'created_at' | 'updated_at' | 'student_count' | 'name' | 'is_active'> & {
+      name?: string;
+      is_active?: boolean;
+    }
+  ): AcademicSection {
+    const instructor = this.getCurrentInstructor();
+    if (!instructor) throw new Error('Not authenticated');
+
+    const cleanSection = (data.section || (data as any).name || 'A').replace(/^Section\s+/i, '').trim().toUpperCase() || 'A';
+    const cleanName = data.name || `Section ${cleanSection}`;
+    const cleanProg = data.programme.trim();
+    const cleanBatch = data.batch.trim();
+    const cleanYear = data.academic_year.trim();
+
+    const sections = loadData<AcademicSection[]>(STORAGE_KEYS.SECTIONS, []);
+    const exists = sections.some(
+      (s) =>
+        s.instructor_id === instructor.id &&
+        s.programme.toLowerCase() === cleanProg.toLowerCase() &&
+        s.batch.toLowerCase() === cleanBatch.toLowerCase() &&
+        s.academic_year.toLowerCase() === cleanYear.toLowerCase() &&
+        (s.section?.toUpperCase() === cleanSection || s.name?.toUpperCase() === cleanName.toUpperCase())
+    );
+
+    if (exists) {
+      throw new Error(`Section ${cleanSection} already exists for ${cleanProg} (${cleanBatch}, ${cleanYear}).`);
+    }
+
+    const newSection: AcademicSection = {
+      ...data,
+      id: 'sec_' + Math.random().toString(36).substring(2, 11),
+      instructor_id: instructor.id,
+      name: cleanName,
+      section: cleanSection,
+      programme: cleanProg,
+      batch: cleanBatch,
+      academic_year: cleanYear,
+      semester: data.semester ? data.semester.trim() : null,
+      is_active: data.is_active ?? true,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      student_count: 0,
+    };
+
+    sections.push(newSection);
+    saveData(STORAGE_KEYS.SECTIONS, sections);
+    return newSection;
+  }
+
+  static updateSection(id: string, updates: Partial<AcademicSection>): AcademicSection {
+    const instructor = this.getCurrentInstructor();
+    if (!instructor) throw new Error('Not authenticated');
+
+    const sections = loadData<AcademicSection[]>(STORAGE_KEYS.SECTIONS, []);
+    const idx = sections.findIndex((s) => s.id === id && s.instructor_id === instructor.id);
+    if (idx === -1) throw new Error('Academic section not found');
+
+    const updated: AcademicSection = {
+      ...sections[idx],
+      ...updates,
+      updated_at: new Date().toISOString(),
+    };
+
+    sections[idx] = updated;
+    saveData(STORAGE_KEYS.SECTIONS, sections);
+    return updated;
+  }
+
+  static findOrCreateSection(
+    programme: string,
+    batch: string,
+    academic_year: string,
+    name: string,
+    semester?: string
+  ): AcademicSection {
+    const instructor = this.getCurrentInstructor();
+    if (!instructor) throw new Error('Not authenticated');
+
+    const cleanName = name.replace(/^Section\s+/i, '').trim().toUpperCase() || 'A';
+    const cleanProg = programme.trim() || 'B.Tech Computer Science';
+    const cleanBatch = batch.trim() || '2024-2028';
+    const cleanYear = academic_year.trim() || '2026-2027';
+
+    const sections = loadData<AcademicSection[]>(STORAGE_KEYS.SECTIONS, []);
+    const found = sections.find(
+      (s) =>
+        s.instructor_id === instructor.id &&
+        s.programme.toLowerCase() === cleanProg.toLowerCase() &&
+        s.batch.toLowerCase() === cleanBatch.toLowerCase() &&
+        s.academic_year.toLowerCase() === cleanYear.toLowerCase() &&
+        s.name.toUpperCase() === cleanName
+    );
+
+    if (found) return found;
+
+    const newSection: AcademicSection = {
+      id: 'sec_' + Math.random().toString(36).substring(2, 11),
+      instructor_id: instructor.id,
+      name: `Section ${cleanName}`,
+      section: cleanName,
+      programme: cleanProg,
+      batch: cleanBatch,
+      academic_year: cleanYear,
+      semester: semester ? semester.trim() : null,
+      is_active: true,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      student_count: 0,
+    };
+    sections.push(newSection);
+    saveData(STORAGE_KEYS.SECTIONS, sections);
+    return newSection;
+  }
+
+  static getSectionStudents(sectionId: string): Student[] {
+    const instructor = this.getCurrentInstructor();
+    if (!instructor) return [];
+
+    const section = this.getSectionById(sectionId);
+    const students = loadData<Student[]>(STORAGE_KEYS.STUDENTS, []).filter(
+      (s) => s.instructor_id === instructor.id && s.is_active
+    );
+
+    if (section) {
+      return students.filter(
+        (s) =>
+          s.section_id === sectionId ||
+          (!s.section_id &&
+            s.course.toLowerCase() === section.programme.toLowerCase() &&
+            s.batch.toLowerCase() === section.batch.toLowerCase() &&
+            s.academic_year.toLowerCase() === section.academic_year.toLowerCase() &&
+            (s.section.toUpperCase() === (section.section || section.name).toUpperCase() ||
+              s.section.toUpperCase() === `SECTION ${(section.section || section.name)}`.toUpperCase()))
+      );
+    }
+
+    return students.filter((s) => s.section_id === sectionId);
+  }
+
+  // -------------------------------------------------------------
   // Students
   // -------------------------------------------------------------
   static getStudents(filters?: {
@@ -222,6 +421,25 @@ export class LocalDatabase {
 
     const targetClassId = (studentData as any).class_id || classId;
 
+    let sectionId = (studentData as any).section_id || null;
+    let course = (studentData.course || '').trim();
+    let batch = (studentData.batch || 'Batch 2024-2028').trim();
+    let academicYear = (studentData.academic_year || 'Year 2').trim();
+    let sectionName = (studentData.section || 'A').trim();
+
+    if (sectionId) {
+      const sec = this.getSectionById(sectionId);
+      if (sec) {
+        course = sec.programme;
+        batch = sec.batch;
+        academicYear = sec.academic_year;
+        sectionName = sec.section || sec.name;
+      }
+    } else if (course && sectionName) {
+      const sec = this.findOrCreateSection(course, batch, academicYear, sectionName);
+      sectionId = sec.id;
+    }
+
     const newStudent: Student = {
       ...studentData,
       id: 'stu_' + Math.random().toString(36).substring(2, 11),
@@ -229,10 +447,11 @@ export class LocalDatabase {
       roll_number: cleanRoll,
       full_name: studentData.full_name.trim(),
       email: studentData.email ? studentData.email.trim() : null,
-      course: (studentData.course || '').trim(),
-      batch: (studentData.batch || 'Batch 2024-2028').trim(),
-      academic_year: (studentData.academic_year || 'Year 2').trim(),
-      section: (studentData.section || 'A').trim(),
+      course,
+      batch,
+      academic_year: academicYear,
+      section: sectionName,
+      section_id: sectionId,
       face_descriptor: studentData.face_descriptor,
       face_enrolled_at: studentData.face_descriptor ? new Date().toISOString() : undefined,
       face_enrollment_status:
@@ -280,6 +499,28 @@ export class LocalDatabase {
     if (cleanUpdates.full_name) cleanUpdates.full_name = cleanUpdates.full_name.trim();
     if (cleanUpdates.email) cleanUpdates.email = cleanUpdates.email.trim();
 
+    // If section_id was changed or provided, synchronize cohort attributes
+    if (cleanUpdates.section_id !== undefined) {
+      if (cleanUpdates.section_id) {
+        const sec = this.getSectionById(cleanUpdates.section_id);
+        if (sec) {
+          cleanUpdates.course = sec.programme;
+          cleanUpdates.batch = sec.batch;
+          cleanUpdates.academic_year = sec.academic_year;
+          cleanUpdates.section = sec.name;
+        }
+      }
+    } else if (cleanUpdates.course || cleanUpdates.section || cleanUpdates.batch || cleanUpdates.academic_year) {
+      const p = cleanUpdates.course || students[idx].course;
+      const b = cleanUpdates.batch || students[idx].batch;
+      const y = cleanUpdates.academic_year || students[idx].academic_year;
+      const s = cleanUpdates.section || students[idx].section;
+      if (p && s) {
+        const sec = this.findOrCreateSection(p, b, y, s);
+        cleanUpdates.section_id = sec.id;
+      }
+    }
+
     const updatedStudent: Student = {
       ...students[idx],
       ...cleanUpdates,
@@ -322,11 +563,9 @@ export class LocalDatabase {
       (c) => c.instructor_id === instructor.id
     );
 
-    const enrollments = loadData<ClassEnrollment[]>(STORAGE_KEYS.ENROLLMENTS, []);
-
     return classes.map((c) => ({
       ...c,
-      enrolled_count: enrollments.filter((e) => e.class_id === c.id).length,
+      enrolled_count: this.getClassEnrollments(c.id).length,
     }));
   }
 
@@ -337,10 +576,12 @@ export class LocalDatabase {
     const found = classes.find((c) => c.id === id && c.instructor_id === instructor.id);
     if (!found) return null;
 
-    const enrollments = loadData<ClassEnrollment[]>(STORAGE_KEYS.ENROLLMENTS, []);
+    const section = found.section_id ? this.getSectionById(found.section_id) : null;
+
     return {
       ...found,
-      enrolled_count: enrollments.filter((e) => e.class_id === found.id).length,
+      section_details: section,
+      enrolled_count: this.getClassEnrollments(found.id).length,
     };
   }
 
@@ -351,7 +592,25 @@ export class LocalDatabase {
     if (!instructor) throw new Error('Not authenticated');
 
     const cleanCode = classData.code.trim().toUpperCase();
-    const cleanSection = (classData.section || 'A').trim().toUpperCase();
+    let cleanSection = (classData.section || 'A').replace(/^Section\s+/i, '').trim().toUpperCase();
+    let cleanProg = classData.programme ? classData.programme.trim() : '';
+    let cleanBatch = classData.batch ? classData.batch.trim() : '';
+    let cleanYear = (classData.academic_year || '2026-2027').trim();
+    let sectionId = classData.section_id || null;
+
+    if (sectionId) {
+      const sec = this.getSectionById(sectionId);
+      if (sec) {
+        cleanProg = sec.programme;
+        cleanBatch = sec.batch;
+        cleanYear = sec.academic_year;
+        cleanSection = sec.section || sec.name;
+      }
+    } else if (cleanProg && cleanSection) {
+      // Auto find or create section for the class
+      const sec = this.findOrCreateSection(cleanProg, cleanBatch || '2024-2028', cleanYear, cleanSection);
+      sectionId = sec.id;
+    }
 
     const classes = loadData<ClassCourse[]>(STORAGE_KEYS.CLASSES, []);
     const exists = classes.some(
@@ -372,7 +631,12 @@ export class LocalDatabase {
       name: classData.name.trim(),
       code: cleanCode,
       section: cleanSection,
-      academic_year: (classData.academic_year || '2025-2026').trim(),
+      section_id: sectionId,
+      programme: cleanProg || null,
+      batch: cleanBatch || null,
+      semester: classData.semester ? classData.semester.trim() : null,
+      enrollment_type: classData.enrollment_type || 'section',
+      academic_year: cleanYear,
       description: classData.description ? classData.description.trim() : null,
       is_active: classData.is_active ?? true,
       created_at: new Date().toISOString(),
@@ -395,7 +659,7 @@ export class LocalDatabase {
 
     if (updates.code || updates.section) {
       const newCode = (updates.code || classes[idx].code).trim().toUpperCase();
-      const newSection = (updates.section || classes[idx].section).trim().toUpperCase();
+      const newSection = (updates.section || classes[idx].section).replace(/^Section\s+/i, '').trim().toUpperCase();
       const duplicate = classes.some(
         (c) =>
           c.id !== id &&
@@ -408,6 +672,16 @@ export class LocalDatabase {
       }
       updates.code = newCode;
       updates.section = newSection;
+    }
+
+    if (updates.section_id) {
+      const sec = this.getSectionById(updates.section_id);
+      if (sec) {
+        updates.programme = sec.programme;
+        updates.batch = sec.batch;
+        updates.academic_year = sec.academic_year;
+        updates.section = sec.name;
+      }
     }
 
     const updated: ClassCourse = {
@@ -425,15 +699,69 @@ export class LocalDatabase {
     const instructor = this.getCurrentInstructor();
     if (!instructor) return [];
 
+    const cls = loadData<ClassCourse[]>(STORAGE_KEYS.CLASSES, []).find(
+      (c) => c.id === classId && c.instructor_id === instructor.id
+    );
+    const allStudents = loadData<Student[]>(STORAGE_KEYS.STUDENTS, []).filter(
+      (s) => s.instructor_id === instructor.id && s.is_active
+    );
+
+    // If manual enrollment mode is explicitly set
+    if (cls && cls.enrollment_type === 'manual') {
+      const enrollments = loadData<ClassEnrollment[]>(STORAGE_KEYS.ENROLLMENTS, []).filter(
+        (e) => e.class_id === classId
+      );
+      const enrolledStudentIds = new Set(enrollments.map((e) => e.student_id));
+      return allStudents.filter((s) => enrolledStudentIds.has(s.id));
+    }
+
+    const rosterMap = new Map<string, Student>();
+
+    if (cls) {
+      // 1. Direct section_id match
+      if (cls.section_id) {
+        allStudents.forEach((s) => {
+          if (s.section_id === cls.section_id) {
+            rosterMap.set(s.id, s);
+          }
+        });
+      }
+
+      // 2. Cohort match (programme/course, batch, academic_year, section)
+      const targetSec = (cls.section || 'A').replace(/^Section\s+/i, '').trim().toUpperCase();
+      const targetYear = (cls.academic_year || '').trim().toLowerCase();
+      const targetProg = (cls.programme || '').trim().toLowerCase();
+      const targetBatch = (cls.batch || '').trim().toLowerCase();
+
+      allStudents.forEach((s) => {
+        const sSec = (s.section || '').replace(/^Section\s+/i, '').trim().toUpperCase();
+        const sYear = (s.academic_year || '').trim().toLowerCase();
+        const sCourse = (s.course || '').trim().toLowerCase();
+        const sBatch = (s.batch || '').trim().toLowerCase();
+
+        const secMatches = sSec === targetSec;
+        const yearMatches = !targetYear || sYear === targetYear;
+        const progMatches = !targetProg || sCourse === targetProg;
+        const batchMatches = !targetBatch || sBatch === targetBatch;
+
+        if (secMatches && yearMatches && progMatches && batchMatches) {
+          rosterMap.set(s.id, s);
+        }
+      });
+    }
+
+    // 3. Union with any explicit manual enrollments in class_enrollments (e.g. cross-section electives)
     const enrollments = loadData<ClassEnrollment[]>(STORAGE_KEYS.ENROLLMENTS, []).filter(
       (e) => e.class_id === classId
     );
-    const students = loadData<Student[]>(STORAGE_KEYS.STUDENTS, []).filter(
-      (s) => s.instructor_id === instructor.id
-    );
+    enrollments.forEach((e) => {
+      const found = allStudents.find((s) => s.id === e.student_id);
+      if (found) {
+        rosterMap.set(found.id, found);
+      }
+    });
 
-    const enrolledStudentIds = new Set(enrollments.map((e) => e.student_id));
-    return students.filter((s) => enrolledStudentIds.has(s.id));
+    return Array.from(rosterMap.values()).sort((a, b) => a.roll_number.localeCompare(b.roll_number));
   }
 
   static getClassEnrolledStudents(classId: string): Student[] {
@@ -681,17 +1009,15 @@ export class LocalDatabase {
     sessions.push(newSession);
     saveData(STORAGE_KEYS.SESSIONS, sessions);
 
-    // Initial unmarked baseline records for all enrolled students
-    const enrollments = loadData<ClassEnrollment[]>(STORAGE_KEYS.ENROLLMENTS, []).filter(
-      (e) => e.class_id === data.class_id
-    );
+    // Initial unmarked baseline records for all enrolled/section students
+    const eligibleStudents = this.getClassEnrollments(data.class_id);
     const records = loadData<AttendanceRecord[]>(STORAGE_KEYS.RECORDS, []);
 
-    enrollments.forEach((e) => {
+    eligibleStudents.forEach((student) => {
       records.push({
         id: 'rec_' + Math.random().toString(36).substring(2, 11),
         session_id: newSession.id,
-        student_id: e.student_id,
+        student_id: student.id,
         status: 'unmarked',
         marked_by: instructor.id,
         marked_at: new Date().toISOString(),
@@ -703,6 +1029,90 @@ export class LocalDatabase {
     saveData(STORAGE_KEYS.RECORDS, records);
 
     return newSession;
+  }
+
+  static refreshSessionRoster(sessionId: string): { addedCount: number; currentCount: number } {
+    const instructor = this.getCurrentInstructor();
+    if (!instructor) throw new Error('Not authenticated');
+
+    const session = this.getSessionById(sessionId);
+    if (!session) throw new Error('Session not found');
+
+    const eligibleStudents = this.getClassEnrollments(session.class_id);
+    const records = loadData<AttendanceRecord[]>(STORAGE_KEYS.RECORDS, []);
+    const existingStudentIds = new Set(
+      records.filter((r) => r.session_id === sessionId).map((r) => r.student_id)
+    );
+
+    let addedCount = 0;
+    eligibleStudents.forEach((student) => {
+      if (!existingStudentIds.has(student.id)) {
+        records.push({
+          id: 'rec_' + Math.random().toString(36).substring(2, 11),
+          session_id: sessionId,
+          student_id: student.id,
+          status: 'unmarked',
+          marked_by: instructor.id,
+          marked_at: new Date().toISOString(),
+          method: 'manual',
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        });
+        addedCount++;
+      }
+    });
+
+    if (addedCount > 0) {
+      saveData(STORAGE_KEYS.RECORDS, records);
+    }
+
+    const sessionRecords = records.filter((r) => r.session_id === sessionId);
+    return Object.assign([...sessionRecords], {
+      addedCount,
+      currentCount: eligibleStudents.length,
+      records: sessionRecords,
+    }) as any;
+  }
+
+  static getAttendanceRecords(sessionId: string): AttendanceRecord[] {
+    return this.getSessionAttendanceRecords(sessionId);
+  }
+
+  static updateAttendanceRecord(
+    sessionId: string,
+    studentId: string,
+    updates: Partial<AttendanceRecord>
+  ): AttendanceRecord {
+    const records = loadData<AttendanceRecord[]>(STORAGE_KEYS.RECORDS, []);
+    let idx = records.findIndex((r) => r.session_id === sessionId && r.student_id === studentId);
+    const instructor = this.getCurrentInstructor();
+
+    if (idx >= 0) {
+      records[idx] = {
+        ...records[idx],
+        ...updates,
+        updated_at: new Date().toISOString(),
+      };
+      saveData(STORAGE_KEYS.RECORDS, records);
+      return records[idx];
+    } else {
+      const newRecord: AttendanceRecord = {
+        id: 'rec_' + Math.random().toString(36).substring(2, 11),
+        session_id: sessionId,
+        student_id: studentId,
+        status: (updates.status as any) || 'unmarked',
+        marked_by: instructor?.id || 'system',
+        marked_at: new Date().toISOString(),
+        method: updates.method || 'manual',
+        confidence_score: updates.confidence_score,
+        notes: updates.notes || null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+      records.push(newRecord);
+      saveData(STORAGE_KEYS.RECORDS, records);
+      return newRecord;
+    }
   }
 
   static updateSessionStatus(sessionId: string, status: SessionStatus): AttendanceSession {
@@ -1164,7 +1574,6 @@ export class LocalDatabase {
     const keys = loadData<PresenceKey[]>(STORAGE_KEYS.PRESENCE_KEYS, []);
     const sessions = loadData<AttendanceSession[]>(STORAGE_KEYS.SESSIONS, []);
     const classes = loadData<ClassCourse[]>(STORAGE_KEYS.CLASSES, []);
-    const enrollments = loadData<ClassEnrollment[]>(STORAGE_KEYS.ENROLLMENTS, []);
 
     let matchedKey: PresenceKey | null = null;
     let matchedSession: AttendanceSession | null = null;
@@ -1212,10 +1621,9 @@ export class LocalDatabase {
       };
     }
 
-    // 5. Verify Student is Enrolled in the Class
-    const isEnrolled = enrollments.some(
-      (e) => e.class_id === matchedSession!.class_id && e.student_id === authenticatedStudentId
-    );
+    // 5. Verify Student is Enrolled in the Class (via Section Roster or Explicit Enrollment)
+    const eligibleStudents = this.getClassEnrollments(matchedSession!.class_id);
+    const isEnrolled = eligibleStudents.some((s) => s.id === authenticatedStudentId);
     if (!isEnrolled) {
       attempts.push({ student_id: authenticatedStudentId, timestamp: nowMs, success: false });
       saveData(STORAGE_KEYS.CHECKIN_ATTEMPTS, attempts);
@@ -2125,6 +2533,7 @@ export class LocalDatabase {
   // -------------------------------------------------------------
   static resetToEmpty(): void {
     const instructor = this.getCurrentInstructor() || DEFAULT_INSTRUCTOR;
+    saveData(STORAGE_KEYS.SECTIONS, []);
     saveData(STORAGE_KEYS.STUDENTS, []);
     saveData(STORAGE_KEYS.CLASSES, []);
     saveData(STORAGE_KEYS.ENROLLMENTS, []);
@@ -2157,6 +2566,48 @@ export class LocalDatabase {
   static seedDemoData(): void {
     const instructor = this.getCurrentInstructor() || DEFAULT_INSTRUCTOR;
 
+    const demoSections: AcademicSection[] = [
+      {
+        id: 'sec-101',
+        instructor_id: instructor.id,
+        name: 'Section A',
+        section: 'A',
+        programme: 'B.Tech Computer Science',
+        batch: 'Batch 2024-2028',
+        academic_year: 'Year 2',
+        semester: 'Semester 4',
+        is_active: true,
+        created_at: new Date(Date.now() - 35 * 86400000).toISOString(),
+        updated_at: new Date().toISOString(),
+      },
+      {
+        id: 'sec-102',
+        instructor_id: instructor.id,
+        name: 'Section B',
+        section: 'B',
+        programme: 'B.Tech Computer Science',
+        batch: 'Batch 2024-2028',
+        academic_year: 'Year 2',
+        semester: 'Semester 4',
+        is_active: true,
+        created_at: new Date(Date.now() - 35 * 86400000).toISOString(),
+        updated_at: new Date().toISOString(),
+      },
+      {
+        id: 'sec-103',
+        instructor_id: instructor.id,
+        name: 'Section A',
+        section: 'A',
+        programme: 'B.Tech Software Engineering',
+        batch: '2024-2028',
+        academic_year: '2026-2027',
+        semester: 'Semester 4',
+        is_active: true,
+        created_at: new Date(Date.now() - 35 * 86400000).toISOString(),
+        updated_at: new Date().toISOString(),
+      },
+    ];
+
     const demoStudents: Student[] = [
       {
         id: 'stu-101',
@@ -2168,6 +2619,7 @@ export class LocalDatabase {
         batch: 'Batch 2024-2028',
         academic_year: 'Year 2',
         section: 'Section A',
+        section_id: 'sec-101',
         photo_path: 'https://images.unsplash.com/photo-1539571696357-5a69c17a67c6?auto=format&fit=crop&w=300&q=80',
         photo_url: 'https://images.unsplash.com/photo-1539571696357-5a69c17a67c6?auto=format&fit=crop&w=300&q=80',
         is_active: true,
@@ -2188,6 +2640,7 @@ export class LocalDatabase {
         batch: 'Batch 2024-2028',
         academic_year: 'Year 2',
         section: 'Section A',
+        section_id: 'sec-101',
         photo_path: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=300&q=80',
         photo_url: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=300&q=80',
         is_active: true,
@@ -2208,6 +2661,7 @@ export class LocalDatabase {
         batch: 'Batch 2024-2028',
         academic_year: 'Year 2',
         section: 'Section A',
+        section_id: 'sec-101',
         photo_path: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&w=300&q=80',
         photo_url: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&w=300&q=80',
         is_active: true,
@@ -2228,6 +2682,7 @@ export class LocalDatabase {
         batch: 'Batch 2024-2028',
         academic_year: 'Year 2',
         section: 'Section B',
+        section_id: 'sec-102',
         photo_path: 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?auto=format&fit=crop&w=300&q=80',
         photo_url: 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?auto=format&fit=crop&w=300&q=80',
         is_active: true,
@@ -2248,6 +2703,7 @@ export class LocalDatabase {
         batch: 'Batch 2024-2028',
         academic_year: 'Year 2',
         section: 'Section B',
+        section_id: 'sec-102',
         photo_path: 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=300&q=80',
         photo_url: 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=300&q=80',
         is_active: false, // inactive student example
@@ -2264,8 +2720,12 @@ export class LocalDatabase {
         instructor_id: instructor.id,
         name: 'Data Structures and Algorithms',
         code: 'CS201',
-        academic_year: '2026-2027',
+        academic_year: 'Year 2',
         section: 'A',
+        section_id: 'sec-101',
+        programme: 'B.Tech Computer Science',
+        batch: 'Batch 2024-2028',
+        enrollment_type: 'section',
         description: 'Comprehensive study of trees, graphs, sorting, and dynamic programming.',
         is_active: true,
         created_at: new Date(Date.now() - 25 * 86400000).toISOString(),
@@ -2276,8 +2736,12 @@ export class LocalDatabase {
         instructor_id: instructor.id,
         name: 'Database Management Systems',
         code: 'CS204',
-        academic_year: '2026-2027',
+        academic_year: 'Year 2',
         section: 'A',
+        section_id: 'sec-101',
+        programme: 'B.Tech Computer Science',
+        batch: 'Batch 2024-2028',
+        enrollment_type: 'section',
         description: 'Relational algebra, SQL, indexing, transaction management and ACID properties.',
         is_active: true,
         created_at: new Date(Date.now() - 24 * 86400000).toISOString(),
@@ -2393,6 +2857,7 @@ export class LocalDatabase {
       },
     ];
 
+    saveData(STORAGE_KEYS.SECTIONS, demoSections);
     saveData(STORAGE_KEYS.STUDENTS, demoStudents);
     saveData(STORAGE_KEYS.CLASSES, demoClasses);
     saveData(STORAGE_KEYS.ENROLLMENTS, demoEnrollments);

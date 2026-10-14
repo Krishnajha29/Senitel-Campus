@@ -64,7 +64,9 @@ export const ClassList: React.FC<ClassListProps> = ({ onStartSessionForClass }) 
       c.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
       c.code.toLowerCase().includes(searchQuery.toLowerCase()) ||
       c.academic_year.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      c.section.toLowerCase().includes(searchQuery.toLowerCase())
+      c.section.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (c.programme && c.programme.toLowerCase().includes(searchQuery.toLowerCase())) ||
+      (c.batch && c.batch.toLowerCase().includes(searchQuery.toLowerCase()))
   );
 
   return (
@@ -168,7 +170,10 @@ export const ClassList: React.FC<ClassListProps> = ({ onStartSessionForClass }) 
                 <h3 className="text-base font-bold text-slate-900 leading-snug">{cls.name}</h3>
 
                 <p className="text-xs text-slate-500 mt-1">
-                  Academic Year: <span className="font-semibold text-slate-700">{cls.academic_year}</span>
+                  Programme: <span className="font-semibold text-slate-700">{cls.section_details?.programme || cls.programme || 'Core Curriculum'}</span>
+                </p>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Cohort: <span className="font-semibold text-slate-700">Batch {cls.section_details?.batch || cls.batch || '2024-2028'}</span> &bull; <span className="text-slate-600">{cls.academic_year}</span>
                 </p>
 
                 {cls.description && (
@@ -177,11 +182,22 @@ export const ClassList: React.FC<ClassListProps> = ({ onStartSessionForClass }) 
                   </p>
                 )}
 
-                {/* Enrolled Count Pill */}
-                <div className="mt-4 inline-flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-50 border border-slate-200/70 text-xs">
-                  <Users className="w-3.5 h-3.5 text-brand-600" />
-                  <span className="font-bold text-slate-800">{cls.enrolled_count || 0}</span>
-                  <span className="text-slate-500">Enrolled Students</span>
+                {/* Enrolled Count Pill & Type */}
+                <div className="mt-4 flex flex-wrap items-center gap-2">
+                  <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-50 border border-slate-200/70 text-xs">
+                    <Users className="w-3.5 h-3.5 text-brand-600" />
+                    <span className="font-bold text-slate-800">{cls.enrolled_count || 0}</span>
+                    <span className="text-slate-500">Active Students</span>
+                  </div>
+                  {cls.enrollment_type === 'manual' ? (
+                    <span className="text-[10px] font-semibold text-indigo-700 bg-indigo-50 border border-indigo-200 px-2 py-1 rounded-lg">
+                      Elective (Manual)
+                    </span>
+                  ) : (
+                    <span className="text-[10px] font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-1 rounded-lg">
+                      Section Cohort
+                    </span>
+                  )}
                 </div>
               </div>
 

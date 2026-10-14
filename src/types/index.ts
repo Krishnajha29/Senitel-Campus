@@ -15,6 +15,21 @@ export interface Instructor {
   updated_at: string;
 }
 
+export interface AcademicSection {
+  id: string;
+  instructor_id: string;
+  name: string; // e.g. 'Section A'
+  section: string; // e.g. 'A'
+  programme: string; // e.g. 'B.Tech Software Engineering' or 'B.Tech Computer Science'
+  batch: string; // e.g. '2024-2028'
+  academic_year: string; // e.g. '2026-2027'
+  semester?: string | null; // e.g. 'Semester 4'
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+  student_count?: number;
+}
+
 export interface Student {
   id: string;
   instructor_id: string;
@@ -25,6 +40,8 @@ export interface Student {
   batch: string;
   academic_year: string;
   section: string;
+  section_id?: string | null;
+  section_details?: AcademicSection | null;
   photo_path: string;
   is_active: boolean;
   created_at: string;
@@ -43,6 +60,12 @@ export interface ClassCourse {
   code: string;
   academic_year: string;
   section: string;
+  section_id?: string | null;
+  programme?: string | null;
+  batch?: string | null;
+  semester?: string | null;
+  enrollment_type?: 'section' | 'manual';
+  section_details?: AcademicSection | null;
   description?: string | null;
   is_active: boolean;
   created_at: string;
@@ -87,6 +110,7 @@ export interface AttendanceRecord {
   marked_by: string;
   marked_at: string;
   method: MarkingMethod;
+  confidence_score?: number | null;
   notes?: string | null;
   face_verification_metadata?: {
     detection_id?: string;

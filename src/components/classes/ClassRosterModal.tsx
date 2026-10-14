@@ -248,6 +248,21 @@ export const ClassRosterModal: React.FC<ClassRosterModalProps> = ({
           ) : !isEnrollMode ? (
             /* View Roster Mode */
             <div className="space-y-4">
+              {/* Automatic Section Notice Banner */}
+              {classObj.enrollment_type !== 'manual' && (
+                <div className="p-4 bg-emerald-50/80 border border-emerald-200 rounded-2xl flex items-start gap-3 shadow-xs">
+                  <ShieldCheck className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
+                  <div className="text-xs text-emerald-950">
+                    <p className="font-bold">
+                      Automatic Section Roster: All active students in {classObj.section_details?.programme || classObj.programme || classObj.name} &bull; Batch {classObj.section_details?.batch || classObj.batch || '2024-2028'} &bull; Section {classObj.section} are automatically included.
+                    </p>
+                    <p className="text-[11px] text-emerald-800 mt-0.5">
+                      To add students to this class, register them in Student Management under Section {classObj.section}.
+                    </p>
+                  </div>
+                </div>
+              )}
+
               {/* Recommended Auto-Repair Banner if matching candidates exist in directory */}
               {matchingCandidates.length > 0 && (
                 <div className="p-3.5 bg-gradient-to-r from-brand-50 to-indigo-50 border border-brand-200 rounded-2xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-xs">
@@ -296,7 +311,7 @@ export const ClassRosterModal: React.FC<ClassRosterModalProps> = ({
                   className="px-3.5 py-2 text-xs font-semibold text-white bg-brand-600 hover:bg-brand-700 rounded-xl transition shadow-sm flex items-center gap-1.5 cursor-pointer shrink-0"
                 >
                   <UserPlus className="w-4 h-4" />
-                  Enroll Students
+                  {classObj.enrollment_type === 'manual' ? 'Enroll Students' : 'Add Cross-Section Student'}
                 </button>
               </div>
 
@@ -359,11 +374,23 @@ export const ClassRosterModal: React.FC<ClassRosterModalProps> = ({
                           <div className="min-w-0">
                             <div className="flex items-center gap-2 flex-wrap">
                               <p className="text-xs font-bold text-slate-900 truncate">{student.full_name}</p>
-                              <span className="font-mono text-[10px] bg-slate-100 text-slate-700 px-1.5 py-0.2 rounded font-semibold">
+                              <span className="font-mono text-[10px] bg-slate-100 text-slate-700 px-1.5 py-0.5 rounded font-semibold">
                                 {student.roll_number}
                               </span>
-                              <span className="text-[10px] font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.2 rounded">
-                                Enrolled
+                              {(classObj.section_id && student.section_id === classObj.section_id) ||
+                              (student.section && student.section.replace(/section\s*/i, '').trim().toUpperCase() === classObj.section.trim().toUpperCase()) ? (
+                                <span className="text-[10px] font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 rounded">
+                                  Section Cohort
+                                </span>
+                              ) : (
+                                <span className="text-[10px] font-semibold text-indigo-700 bg-indigo-50 border border-indigo-200 px-1.5 py-0.5 rounded">
+                                  Cross-Section / Elective
+                                </span>
+                              )}
+                              <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${
+                                student.is_active ? 'text-slate-700 bg-slate-100 border-slate-200' : 'text-rose-700 bg-rose-50 border-rose-200'
+                              }`}>
+                                {student.is_active ? 'Active' : 'Inactive'}
                               </span>
                             </div>
 

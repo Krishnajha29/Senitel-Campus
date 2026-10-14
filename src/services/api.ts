@@ -5,6 +5,7 @@ import type {
   Instructor,
   Student,
   ClassCourse,
+  AcademicSection,
   AttendanceSession,
   AttendanceRecord,
   AttendanceAuditLog,
@@ -153,6 +154,193 @@ export class ApiService {
     }
 
     return LocalDatabase.updateInstructorProfile(profile);
+  }
+
+  // -------------------------------------------------------------
+  // Academic Sections (Institutional Cohorts)
+  // -------------------------------------------------------------
+  static async getSections(filters?: {
+    programme?: string;
+    batch?: string;
+    academic_year?: string;
+    is_active?: boolean | null;
+  }): Promise<AcademicSection[]> {
+    if (isSupabaseConfigured()) {
+      const instructor = await this.getCurrentInstructor();
+      if (!instructor) return [];
+
+      let query = supabase
+        .from('academic_sections')
+        .select('*, students(id, is_active)')
+        .eq('instructor_id', instructor.id);
+
+      if (filters?.is_active !== undefined && filters?.is_active !== null) {
+        query = query.eq('is_active', filters.is_active);
+      }
+      if (filters?.programme) query = query.eq('programme', filters.programme);
+      if (filters?.batch) query = query.eq('batch', filters.batch);
+      if (filters?.academic_year) query = query.eq('academic_year', filters.academic_year);
+
+      const { data, error } = await query.order('programme').order('name');
+      if (error || !data) return [];
+
+      return data.map((sec: any) => ({
+        id: sec.id,
+        instructor_id: sec.instructor_id,
+        name: sec.name || `Section ${sec.section || 'A'}`,
+        section: sec.section || sec.name?.replace(/^Section\s+/i, '') || 'A',
+        programme: sec.programme,
+        batch: sec.batch,
+        academic_year: sec.academic_year,
+        semester: sec.semester,
+        is_active: sec.is_active,
+        created_at: sec.created_at,
+        updated_at: sec.updated_at,
+        student_count: (sec.students || []).filter((s: any) => s.is_active).length,
+      }));
+    }
+
+    return LocalDatabase.getSections(filters);
+  }
+
+  static async getSectionById(id: string): Promise<AcademicSection | null> {
+    if (isSupabaseConfigured()) {
+      const instructor = await this.getCurrentInstructor();
+      if (!instructor) return null;
+
+      const { data, error } = await supabase
+        .from('academic_sections')
+        .select('*, students(id, is_active)')
+        .eq('id', id)
+        .eq('instructor_id', instructor.id)
+        .single();
+
+      if (error || !data) return null;
+
+      return {
+        id: data.id,
+        instructor_id: data.instructor_id,
+        name: data.name || `Section ${data.section || 'A'}`,
+        section: data.section || data.name?.replace(/^Section\s+/i, '') || 'A',
+        programme: data.programme,
+        batch: data.batch,
+        academic_year: data.academic_year,
+        semester: data.semester,
+        is_active: data.is_active,
+        created_at: data.created_at,
+        updated_at: data.updated_at,
+        student_count: (data.students || []).filter((s: any) => s.is_active).length,
+      };
+    }
+
+    return LocalDatabase.getSectionById(id);
+  }
+
+  static async createSection(
+    data: Omit<AcademicSection, 'id' | 'instructor_id' | 'created_at' | 'updated_at' | 'student_count' | 'name' | 'is_active'> & {
+      name?: string;
+      is_active?: boolean;
+    }
+  ): Promise<AcademicSection> {
+    const instructor = await this.getCurrentInstructor();
+    if (!instructor) throw new Error('Not authenticated');
+
+    if (isSupabaseConfigured()) {
+      const cleanSection = (data.section || data.name || 'A').replace(/^Section\s+/i, '').trim().toUpperCase() || 'A';
+      const cleanName = data.name || `Section ${cleanSection}`;
+      const cleanProg = data.programme.trim();
+      const cleanBatch = data.batch.trim();
+      const cleanYear = data.academic_year.trim();
+
+      const { data: created, error } = await supabase
+        .from('academic_sections')
+        .insert({
+          ...data,
+          instructor_id: instructor.id,
+          name: cleanName,
+          section: cleanSection,
+          programme: cleanProg,
+          batch: cleanBatch,
+          academic_year: cleanYear,
+          semester: data.semester ? data.semester.trim() : null,
+          is_active: data.is_active ?? true,
+        })
+        .select()
+        .single();
+
+      if (error) {
+        if (error.code === '23505') {
+          throw new Error(`Section ${cleanName} already exists for ${cleanProg} (${cleanBatch}, ${cleanYear}).`);
+        }
+        throw new Error(error.message);
+      }
+
+      return { ...(created as AcademicSection), student_count: 0 };
+    }
+
+    return LocalDatabase.createSection(data);
+  }
+
+  static async findOrCreateSection(
+    programme: string,
+    batch: string,
+    academic_year: string,
+    name: string,
+    semester?: string
+  ): Promise<AcademicSection> {
+    const instructor = await this.getCurrentInstructor();
+    if (!instructor) throw new Error('Not authenticated');
+
+    const cleanName = name.replace(/^Section\s+/i, '').trim().toUpperCase() || 'A';
+    const cleanProg = programme.trim() || 'B.Tech Computer Science';
+    const cleanBatch = batch.trim() || '2024-2028';
+    const cleanYear = academic_year.trim() || '2026-2027';
+
+    if (isSupabaseConfigured()) {
+      const { data: existing } = await supabase
+        .from('academic_sections')
+        .select('*')
+        .eq('instructor_id', instructor.id)
+        .eq('programme', cleanProg)
+        .eq('batch', cleanBatch)
+        .eq('academic_year', cleanYear)
+        .eq('name', cleanName)
+        .maybeSingle();
+
+      if (existing) return existing as AcademicSection;
+
+      return this.createSection({
+        name: `Section ${cleanName}`,
+        section: cleanName,
+        programme: cleanProg,
+        batch: cleanBatch,
+        academic_year: cleanYear,
+        semester: semester || null,
+        is_active: true,
+      });
+    }
+
+    return LocalDatabase.findOrCreateSection(cleanProg, cleanBatch, cleanYear, cleanName, semester);
+  }
+
+  static async getSectionStudents(sectionId: string): Promise<Student[]> {
+    if (isSupabaseConfigured()) {
+      const instructor = await this.getCurrentInstructor();
+      if (!instructor) return [];
+
+      const { data, error } = await supabase
+        .from('students')
+        .select('*')
+        .eq('instructor_id', instructor.id)
+        .eq('section_id', sectionId)
+        .eq('is_active', true)
+        .order('roll_number');
+
+      if (error || !data) return [];
+      return data as Student[];
+    }
+
+    return LocalDatabase.getSectionStudents(sectionId);
   }
 
   // -------------------------------------------------------------
@@ -500,7 +688,7 @@ export class ApiService {
 
       const { data, error } = await supabase
         .from('classes')
-        .select('*, class_enrollments(count)')
+        .select('*, academic_sections(*), class_enrollments(count)')
         .eq('instructor_id', instructor.id)
         .order('name');
 
@@ -509,10 +697,22 @@ export class ApiService {
         return [];
       }
 
-      return (data || []).map((c: any) => ({
-        ...c,
-        enrolled_count: c.class_enrollments?.[0]?.count || 0,
-      }));
+      const withCounts = await Promise.all(
+        (data || []).map(async (c: any) => {
+          let count = c.class_enrollments?.[0]?.count || 0;
+          try {
+            const roster = await this.getClassEnrollments(c.id);
+            count = roster.length;
+          } catch {}
+          return {
+            ...c,
+            section_details: c.academic_sections || null,
+            enrolled_count: count,
+          };
+        })
+      );
+
+      return withCounts;
     }
 
     return LocalDatabase.getClasses();
@@ -525,15 +725,21 @@ export class ApiService {
 
       const { data, error } = await supabase
         .from('classes')
-        .select('*, class_enrollments(count)')
+        .select('*, academic_sections(*), class_enrollments(count)')
         .eq('id', id)
         .eq('instructor_id', instructor.id)
         .single();
 
       if (error || !data) return null;
+      let count = data.class_enrollments?.[0]?.count || 0;
+      try {
+        const roster = await this.getClassEnrollments(id);
+        count = roster.length;
+      } catch {}
       return {
         ...data,
-        enrolled_count: data.class_enrollments?.[0]?.count || 0,
+        section_details: data.academic_sections || null,
+        enrolled_count: count,
       };
     }
 
@@ -608,39 +814,71 @@ export class ApiService {
 
   static async getClassEnrollments(classId: string): Promise<Student[]> {
     if (isSupabaseConfigured()) {
-      const { data, error } = await supabase
+      const { data: classObj, error: classErr } = await supabase
+        .from('classes')
+        .select('*')
+        .eq('id', classId)
+        .single();
+
+      if (classErr) {
+        console.error('Error fetching class in getClassEnrollments:', classErr);
+        throw new Error(`Database error loading class: ${classErr.message}`);
+      }
+
+      const rosterMap = new Map<string, Student>();
+
+      // 1. If section-based class (or default), fetch all active students belonging to that section/cohort
+      if (!classObj.enrollment_type || classObj.enrollment_type === 'section') {
+        let sectionStudentsQuery = supabase
+          .from('students')
+          .select('*')
+          .eq('instructor_id', classObj.instructor_id)
+          .eq('is_active', true);
+
+        if (classObj.section_id) {
+          sectionStudentsQuery = sectionStudentsQuery.eq('section_id', classObj.section_id);
+        } else {
+          // Cohort fallback
+          const targetSec = (classObj.section || 'A').replace(/^Section\s+/i, '').trim();
+          sectionStudentsQuery = sectionStudentsQuery.or(`section.ilike.${targetSec},section.ilike.Section ${targetSec}`);
+          if (classObj.academic_year) {
+            sectionStudentsQuery = sectionStudentsQuery.eq('academic_year', classObj.academic_year);
+          }
+          if (classObj.programme) {
+            sectionStudentsQuery = sectionStudentsQuery.ilike('course', classObj.programme);
+          }
+          if (classObj.batch) {
+            sectionStudentsQuery = sectionStudentsQuery.ilike('batch', classObj.batch);
+          }
+        }
+
+        const { data: secStudents, error: secErr } = await sectionStudentsQuery;
+        if (secErr) {
+          console.error('Error fetching section students for class:', secErr);
+          throw new Error(`Database error loading section students: ${secErr.message}`);
+        }
+
+        (secStudents || []).forEach((s: any) => rosterMap.set(s.id, s as Student));
+      }
+
+      // 2. Also union with explicit manual enrollments (e.g. cross-section electives)
+      const { data: explicitData, error: explicitErr } = await supabase
         .from('class_enrollments')
         .select('student_id, students(*)')
         .eq('class_id', classId);
 
-      if (error) {
-        console.error('Error fetching class enrollments from Supabase:', error);
-        throw new Error(`Database error loading class enrollments: ${error.message}`);
+      if (!explicitErr && explicitData) {
+        explicitData.forEach((d: any) => {
+          if (d.students && d.students.is_active) {
+            rosterMap.set(d.students.id, d.students as Student);
+          }
+        });
       }
 
-      if (!data || data.length === 0) return [];
-      let students = data.map((d: any) => d.students).filter(Boolean) as Student[];
-
-      // Fallback: If join returned empty students but enrollment rows exist, query students by ID
-      if (students.length === 0 && data.length > 0) {
-        const studentIds = data.map((d: any) => d.student_id).filter(Boolean);
-        if (studentIds.length > 0) {
-          const { data: directStudents, error: directErr } = await supabase
-            .from('students')
-            .select('*')
-            .in('id', studentIds);
-          if (directErr) {
-            console.error('Direct student fallback query error:', directErr);
-            throw new Error(`Failed to load student profiles: ${directErr.message}`);
-          }
-          if (directStudents) {
-            students = directStudents as Student[];
-          }
-        }
-      }
+      const finalStudents = Array.from(rosterMap.values()).sort((a, b) => a.roll_number.localeCompare(b.roll_number));
 
       return Promise.all(
-        students.map(async (s) => ({
+        finalStudents.map(async (s) => ({
           ...s,
           photo_url: await getStudentPhotoUrl(s.photo_path),
         }))
@@ -897,21 +1135,20 @@ export class ApiService {
 
       if (error || !session) throw new Error(`Failed to create session: ${error?.message}`);
 
-      // 2. Fetch enrolled students and initialize unmarked records
-      const { data: enrollments } = await supabase
-        .from('class_enrollments')
-        .select('student_id')
-        .eq('class_id', data.class_id);
+      // 2. Fetch all section & enrolled students and initialize baseline unmarked records
+      const eligibleStudents = await this.getClassEnrollments(data.class_id);
 
-      if (enrollments && enrollments.length > 0) {
-        const baseline = enrollments.map((e) => ({
+      if (eligibleStudents && eligibleStudents.length > 0) {
+        const baseline = eligibleStudents.map((s) => ({
           session_id: session.id,
-          student_id: e.student_id,
+          student_id: s.id,
           status: 'unmarked',
           marked_by: instructor.id,
           method: 'manual',
         }));
-        await supabase.from('attendance_records').insert(baseline);
+        await supabase
+          .from('attendance_records')
+          .upsert(baseline, { onConflict: 'session_id,student_id' });
       }
 
       return {
@@ -922,13 +1159,52 @@ export class ApiService {
           present: 0,
           absent: 0,
           late: 0,
-          unmarked: enrollments?.length || 0,
-          total: enrollments?.length || 0,
+          unmarked: eligibleStudents.length,
+          total: eligibleStudents.length,
         },
       };
     }
 
     return LocalDatabase.createAttendanceSession(data);
+  }
+
+  static async refreshSessionRoster(sessionId: string): Promise<{ addedCount: number; currentCount: number }> {
+    if (isSupabaseConfigured()) {
+      const instructor = await this.getCurrentInstructor();
+      if (!instructor) throw new Error('Not authenticated');
+
+      const session = await this.getSessionById(sessionId);
+      if (!session) throw new Error('Session not found');
+
+      const eligibleStudents = await this.getClassEnrollments(session.class_id);
+      const { data: records } = await supabase
+        .from('attendance_records')
+        .select('student_id')
+        .eq('session_id', sessionId);
+
+      const existingIds = new Set((records || []).map((r: any) => r.student_id));
+      const missingStudents = eligibleStudents.filter((s) => !existingIds.has(s.id));
+
+      if (missingStudents.length > 0) {
+        const baseline = missingStudents.map((s) => ({
+          session_id: sessionId,
+          student_id: s.id,
+          status: 'unmarked',
+          marked_by: instructor.id,
+          method: 'manual',
+        }));
+        await supabase
+          .from('attendance_records')
+          .upsert(baseline, { onConflict: 'session_id,student_id' });
+      }
+
+      return {
+        addedCount: missingStudents.length,
+        currentCount: eligibleStudents.length,
+      };
+    }
+
+    return LocalDatabase.refreshSessionRoster(sessionId);
   }
 
   static async updateSessionStatus(sessionId: string, status: SessionStatus): Promise<AttendanceSession> {

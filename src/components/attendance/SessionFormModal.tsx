@@ -130,6 +130,44 @@ export const SessionFormModal: React.FC<SessionFormModalProps> = ({
             </select>
           </div>
 
+          {(() => {
+            const selectedClass = classes.find((c) => c.id === classId);
+            if (!selectedClass) return null;
+            return (
+              <div className="p-3.5 bg-slate-50 border border-slate-200/80 rounded-2xl space-y-1.5 text-xs">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-slate-800">
+                    Section {selectedClass.section} Cohort Details
+                  </span>
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                    {selectedClass.enrolled_count ?? 0} Eligible Students
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-[11px] text-slate-600">
+                  <div>
+                    <span className="text-slate-400">Programme: </span>
+                    <span className="font-medium text-slate-800">{selectedClass.section_details?.programme || selectedClass.programme || 'Core Curriculum'}</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400">Batch: </span>
+                    <span className="font-medium text-slate-800">Batch {selectedClass.section_details?.batch || selectedClass.batch || '2024-2028'}</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400">Academic Year: </span>
+                    <span className="font-medium text-slate-800">{selectedClass.academic_year}</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400">Section: </span>
+                    <span className="font-bold text-brand-700">Section {selectedClass.section}</span>
+                  </div>
+                </div>
+                <p className="text-[10px] text-slate-500 pt-1 border-t border-slate-200/60">
+                  {selectedClass.enrolled_count ?? 0} active students in Section {selectedClass.section} will be automatically initialized in this session roster.
+                </p>
+              </div>
+            );
+          })()}
+
           <div>
             <label className="block text-xs font-semibold text-slate-700 mb-1.5">
               Lecture Title / Topic <span className="text-rose-500">*</span>

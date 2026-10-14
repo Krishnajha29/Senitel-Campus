@@ -190,6 +190,28 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
     }
   }, [isOpen, loadClassRoster]);
 
+  const [isSyncingSectionRoster, setIsSyncingSectionRoster] = useState<boolean>(false);
+
+  const handleSyncSectionRoster = async () => {
+    if (!session?.id) return;
+    try {
+      setIsSyncingSectionRoster(true);
+      await ApiService.refreshSessionRoster(session.id);
+      await loadClassRoster();
+      toast.success(
+        'Section Roster Refreshed',
+        'Session roster synchronized with current active section students.'
+      );
+      if (onAttendanceSubmitted) {
+        onAttendanceSubmitted();
+      }
+    } catch (err: any) {
+      toast.error('Sync Failed', err.message || 'Could not sync section roster.');
+    } finally {
+      setIsSyncingSectionRoster(false);
+    }
+  };
+
   const handleAutoEnrollMatching = async () => {
     if (!session?.class_id || matchingDirectoryCandidates.length === 0) return;
     try {
@@ -1042,11 +1064,12 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
 
                     <button
                       type="button"
-                      onClick={loadClassRoster}
+                      onClick={handleSyncSectionRoster}
+                      disabled={isSyncingSectionRoster}
                       className="px-3 py-1.5 bg-white/80 border border-slate-300 hover:bg-white text-slate-700 font-semibold text-xs rounded-xl transition cursor-pointer flex items-center gap-1"
                     >
-                      <RefreshCw className="w-3 h-3 text-slate-500" />
-                      Refresh Roster
+                      <RefreshCw className={`w-3 h-3 text-slate-500 ${isSyncingSectionRoster ? 'animate-spin' : ''}`} />
+                      Refresh Section Roster
                     </button>
                   </div>
                 </div>
@@ -1055,11 +1078,23 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
               <div className="p-4 rounded-2xl bg-amber-50 border border-amber-300 flex items-start gap-3.5 text-xs text-amber-950">
                 <ShieldAlert className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
                 <div className="space-y-2 flex-1">
-                  <div>
-                    <span className="font-bold text-amber-900 text-sm">Biometric Enrollment Notice: </span>
-                    <p className="mt-0.5">
-                      0 of {effectiveRoster.length} enrolled students have 128-d biometric face vectors registered. You can still scan classroom photos to detect faces, but automated matching requires registered embeddings.
-                    </p>
+                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                    <div>
+                      <span className="font-bold text-amber-900 text-sm">Biometric Enrollment Notice: </span>
+                      <p className="mt-0.5">
+                        0 of {effectiveRoster.length} enrolled students have 128-d biometric face vectors registered. You can still scan classroom photos to detect faces, but automated matching requires registered embeddings.
+                      </p>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={handleSyncSectionRoster}
+                      disabled={isSyncingSectionRoster}
+                      className="px-2.5 py-1 text-[11px] font-bold text-amber-900 bg-white border border-amber-300 rounded-lg hover:bg-amber-100 transition shrink-0 cursor-pointer flex items-center gap-1 self-start"
+                    >
+                      <RefreshCw className={`w-3 h-3 text-amber-600 ${isSyncingSectionRoster ? 'animate-spin' : ''}`} />
+                      Refresh Section Roster
+                    </button>
                   </div>
 
                   {enrolledNeedingBiometrics.length > 0 && (
@@ -1106,13 +1141,26 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
                   </div>
                 </div>
 
-                <button
-                  type="button"
-                  onClick={() => setIsClassRosterModalOpen(true)}
-                  className="px-2.5 py-1 text-[11px] font-bold text-emerald-800 bg-white border border-emerald-300 rounded-lg hover:bg-emerald-100 transition shrink-0 cursor-pointer"
-                >
-                  View Roster
-                </button>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={handleSyncSectionRoster}
+                    disabled={isSyncingSectionRoster}
+                    title="Re-sync active students from the section cohort"
+                    className="px-2.5 py-1 text-[11px] font-bold text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition cursor-pointer flex items-center gap-1"
+                  >
+                    <RefreshCw className={`w-3 h-3 text-slate-500 ${isSyncingSectionRoster ? 'animate-spin' : ''}`} />
+                    Refresh Section Roster
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setIsClassRosterModalOpen(true)}
+                    className="px-2.5 py-1 text-[11px] font-bold text-emerald-800 bg-white border border-emerald-300 rounded-lg hover:bg-emerald-100 transition shrink-0 cursor-pointer"
+                  >
+                    View Roster
+                  </button>
+                </div>
               </div>
             )}
 
