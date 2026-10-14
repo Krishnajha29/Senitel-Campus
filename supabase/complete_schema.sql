@@ -743,6 +743,17 @@ BEGIN
         SELECT EXISTS (
             SELECT 1 FROM public.class_enrollments
             WHERE class_id = v_class_id AND student_id = v_student_id
+            UNION
+            SELECT 1 FROM public.classes c
+            JOIN public.students s ON (
+                (c.section_id IS NOT NULL AND s.section_id = c.section_id)
+                OR (
+                    c.section = s.section 
+                    AND (c.academic_year IS NULL OR s.academic_year = c.academic_year)
+                    AND (c.programme IS NULL OR s.course = c.programme)
+                )
+            )
+            WHERE c.id = v_class_id AND s.id = v_student_id AND s.is_active = true
         ) INTO v_is_enrolled;
 
         IF NOT v_is_enrolled THEN

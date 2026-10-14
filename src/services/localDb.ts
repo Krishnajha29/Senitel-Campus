@@ -1895,7 +1895,6 @@ export class LocalDatabase {
       throw new Error('Cannot submit face attendance for a closed or finalized session.');
     }
 
-    const enrollments = loadData<ClassEnrollment[]>(STORAGE_KEYS.ENROLLMENTS, []);
     const records = loadData<AttendanceRecord[]>(STORAGE_KEYS.RECORDS, []);
     const auditLogs = loadData<AttendanceAuditLog[]>(STORAGE_KEYS.AUDIT_LOGS, []);
     const nowIso = new Date().toISOString();
@@ -1904,13 +1903,14 @@ export class LocalDatabase {
     let alreadyPresentCount = 0;
     const auditLogIds: string[] = [];
 
+    const eligibleStudents = this.getClassEnrollments(session.class_id);
+    const eligibleStudentIds = new Set(eligibleStudents.map((s) => s.id));
+
     submissions.forEach((item) => {
-      // 1. Verify class enrollment
-      const isEnrolled = enrollments.some(
-        (e) => e.class_id === session.class_id && e.student_id === item.studentId
-      );
+      // 1. Verify class enrollment (via institutional section or explicit class enrollment)
+      const isEnrolled = eligibleStudentIds.has(item.studentId);
       if (!isEnrolled) {
-        // Enforce rule: student not enrolled in this class cannot be marked present
+        // Enforce rule: student not eligible for this class cannot be marked present
         return;
       }
 
