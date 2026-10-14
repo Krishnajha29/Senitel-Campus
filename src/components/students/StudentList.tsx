@@ -154,7 +154,7 @@ export const StudentList: React.FC<StudentListProps> = ({ onStudentCountChange }
   };
 
   const handleSaveStudent = async (
-    data: Omit<Student, 'id' | 'instructor_id' | 'created_at' | 'updated_at'>,
+    data: Omit<Student, 'id' | 'instructor_id' | 'created_at' | 'updated_at'> & { class_id?: string },
     photoFile?: File,
     onProgress?: (pct: number) => void
   ) => {

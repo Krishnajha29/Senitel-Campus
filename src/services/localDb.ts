@@ -209,7 +209,8 @@ export class LocalDatabase {
   }
 
   static createStudent(
-    studentData: Omit<Student, 'id' | 'instructor_id' | 'created_at' | 'updated_at'>
+    studentData: Omit<Student, 'id' | 'instructor_id' | 'created_at' | 'updated_at'> & { class_id?: string },
+    classId?: string
   ): Student {
     const instructor = this.getCurrentInstructor();
     if (!instructor) throw new Error('Not authenticated');
@@ -219,7 +220,7 @@ export class LocalDatabase {
       throw new Error(`This roll number already exists (${cleanRoll}).`);
     }
 
-    const targetClassId = (studentData as any).class_id;
+    const targetClassId = (studentData as any).class_id || classId;
 
     const newStudent: Student = {
       ...studentData,
@@ -228,10 +229,10 @@ export class LocalDatabase {
       roll_number: cleanRoll,
       full_name: studentData.full_name.trim(),
       email: studentData.email ? studentData.email.trim() : null,
-      course: studentData.course.trim(),
-      batch: studentData.batch.trim(),
-      academic_year: studentData.academic_year.trim(),
-      section: studentData.section.trim(),
+      course: (studentData.course || '').trim(),
+      batch: (studentData.batch || 'Batch 2024-2028').trim(),
+      academic_year: (studentData.academic_year || 'Year 2').trim(),
+      section: (studentData.section || 'A').trim(),
       face_descriptor: studentData.face_descriptor,
       face_enrolled_at: studentData.face_descriptor ? new Date().toISOString() : undefined,
       face_enrollment_status:
@@ -253,7 +254,11 @@ export class LocalDatabase {
     return newStudent;
   }
 
-  static updateStudent(id: string, updates: Partial<Student>): Student {
+  static updateStudent(
+    id: string,
+    updates: Partial<Student> & { class_id?: string },
+    classId?: string
+  ): Student {
     const instructor = this.getCurrentInstructor();
     if (!instructor) throw new Error('Not authenticated');
 
@@ -261,25 +266,44 @@ export class LocalDatabase {
     const idx = students.findIndex((s) => s.id === id && s.instructor_id === instructor.id);
     if (idx === -1) throw new Error('Student not found');
 
-    if (updates.roll_number) {
-      const cleanRoll = updates.roll_number.trim().toUpperCase();
+    const targetClassId = updates.class_id !== undefined ? updates.class_id : classId;
+    const { class_id: _, ...cleanUpdates } = updates as any;
+
+    if (cleanUpdates.roll_number) {
+      const cleanRoll = cleanUpdates.roll_number.trim().toUpperCase();
       if (this.checkRollNumberExists(cleanRoll, id)) {
         throw new Error(`This roll number already exists (${cleanRoll}).`);
       }
-      updates.roll_number = cleanRoll;
+      cleanUpdates.roll_number = cleanRoll;
     }
 
-    if (updates.full_name) updates.full_name = updates.full_name.trim();
-    if (updates.email) updates.email = updates.email.trim();
+    if (cleanUpdates.full_name) cleanUpdates.full_name = cleanUpdates.full_name.trim();
+    if (cleanUpdates.email) cleanUpdates.email = cleanUpdates.email.trim();
 
     const updatedStudent: Student = {
       ...students[idx],
-      ...updates,
+      ...cleanUpdates,
       updated_at: new Date().toISOString(),
     };
 
     students[idx] = updatedStudent;
     saveData(STORAGE_KEYS.STUDENTS, students);
+
+    // Handle class enrollment change if specified
+    if (targetClassId !== undefined) {
+      const currentEnrs = this.getStudentEnrollments(id);
+      if (targetClassId && !currentEnrs.includes(targetClassId)) {
+        for (const oldClassId of currentEnrs) {
+          this.removeStudentFromClass(oldClassId, id);
+        }
+        this.enrollStudentsInClass(targetClassId, [id]);
+      } else if (targetClassId === '' && currentEnrs.length > 0) {
+        for (const oldClassId of currentEnrs) {
+          this.removeStudentFromClass(oldClassId, id);
+        }
+      }
+    }
+
     return updatedStudent;
   }
 
@@ -327,7 +351,7 @@ export class LocalDatabase {
     if (!instructor) throw new Error('Not authenticated');
 
     const cleanCode = classData.code.trim().toUpperCase();
-    const cleanSection = classData.section.trim().toUpperCase();
+    const cleanSection = (classData.section || 'A').trim().toUpperCase();
 
     const classes = loadData<ClassCourse[]>(STORAGE_KEYS.CLASSES, []);
     const exists = classes.some(
@@ -348,7 +372,7 @@ export class LocalDatabase {
       name: classData.name.trim(),
       code: cleanCode,
       section: cleanSection,
-      academic_year: classData.academic_year.trim(),
+      academic_year: (classData.academic_year || '2025-2026').trim(),
       description: classData.description ? classData.description.trim() : null,
       is_active: classData.is_active ?? true,
       created_at: new Date().toISOString(),
@@ -435,6 +459,46 @@ export class LocalDatabase {
     });
 
     saveData(STORAGE_KEYS.ENROLLMENTS, enrollments);
+
+    // Initialize baseline records for any active sessions of this class
+    const sessions = loadData<AttendanceSession[]>(STORAGE_KEYS.SESSIONS, []).filter(
+      (s) => s.class_id === classId && s.status === 'active'
+    );
+    if (sessions.length > 0) {
+      const records = loadData<AttendanceRecord[]>(STORAGE_KEYS.RECORDS, []);
+      sessions.forEach((sess) => {
+        studentIds.forEach((studentId) => {
+          const hasRecord = records.some(
+            (r) => r.session_id === sess.id && r.student_id === studentId
+          );
+          if (!hasRecord) {
+            records.push({
+              id: 'rec_' + Math.random().toString(36).substring(2, 11),
+              session_id: sess.id,
+              student_id: studentId,
+              status: 'unmarked',
+              marked_by: sess.instructor_id,
+              marked_at: new Date().toISOString(),
+              method: 'manual',
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            });
+          }
+        });
+      });
+      saveData(STORAGE_KEYS.RECORDS, records);
+    }
+  }
+
+  static enrollStudentInClass(classId: string, studentId: string): void {
+    this.enrollStudentsInClass(classId, [studentId]);
+  }
+
+  static getStudentEnrollments(studentId: string): string[] {
+    const enrollments = loadData<ClassEnrollment[]>(STORAGE_KEYS.ENROLLMENTS, []);
+    return enrollments
+      .filter((e) => e.student_id === studentId)
+      .map((e) => e.class_id);
   }
 
   static removeStudentFromClass(classId: string, studentId: string): void {
@@ -443,6 +507,66 @@ export class LocalDatabase {
       (e) => !(e.class_id === classId && e.student_id === studentId)
     );
     saveData(STORAGE_KEYS.ENROLLMENTS, enrollments);
+  }
+
+  /**
+   * Safe Repair Workflow for LocalDatabase:
+   * Inspects existing registered students who have missing enrollment records.
+   * Confidently matches student course/batch against active class names and enrolls them.
+   */
+  static repairClassEnrollments(
+    targetClassId?: string
+  ): { repairedCount: number; repairedStudents: Student[] } {
+    const instructor = this.getCurrentInstructor();
+    if (!instructor) return { repairedCount: 0, repairedStudents: [] };
+
+    const students = loadData<Student[]>(STORAGE_KEYS.STUDENTS, []).filter(
+      (s) => s.instructor_id === instructor.id
+    );
+    const classes = loadData<ClassCourse[]>(STORAGE_KEYS.CLASSES, []).filter(
+      (c) => c.instructor_id === instructor.id && c.is_active
+    );
+
+    const classesToMatch = targetClassId
+      ? classes.filter((c) => c.id === targetClassId)
+      : classes;
+
+    if (classesToMatch.length === 0) {
+      return { repairedCount: 0, repairedStudents: [] };
+    }
+
+    const repairedStudents: Student[] = [];
+
+    for (const student of students) {
+      const enrolled = this.getStudentEnrollments(student.id);
+      if (enrolled.length > 0) continue;
+
+      const studentCourse = (student.course || '').trim().toLowerCase();
+      const studentBatch = (student.batch || '').trim().toLowerCase();
+
+      const matching = classesToMatch.filter((cls) => {
+        const clsName = cls.name.trim().toLowerCase();
+        const clsCode = cls.code.trim().toLowerCase();
+        return (
+          studentCourse === clsName ||
+          studentCourse === clsCode ||
+          clsName.includes(studentCourse) ||
+          studentCourse.includes(clsName) ||
+          studentBatch.includes(clsName) ||
+          studentBatch.includes(clsCode)
+        );
+      });
+
+      if (matching.length === 1) {
+        this.enrollStudentsInClass(matching[0].id, [student.id]);
+        repairedStudents.push(student);
+      }
+    }
+
+    return {
+      repairedCount: repairedStudents.length,
+      repairedStudents,
+    };
   }
 
   // -------------------------------------------------------------
@@ -631,6 +755,10 @@ export class LocalDatabase {
   static getSessionAttendanceRecords(sessionId: string): AttendanceRecord[] {
     const records = loadData<AttendanceRecord[]>(STORAGE_KEYS.RECORDS, []);
     return records.filter((r) => r.session_id === sessionId);
+  }
+
+  static getSessionRecords(sessionId: string): AttendanceRecord[] {
+    return this.getSessionAttendanceRecords(sessionId);
   }
 
   static getSessionAttendance(

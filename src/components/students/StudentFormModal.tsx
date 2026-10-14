@@ -85,6 +85,15 @@ export const StudentFormModal: React.FC<StudentFormModalProps> = ({
       setFaceStatusMessage(studentToEdit.face_descriptor ? 'Face biometrics enrolled' : '');
       setPhotoFile(null);
       setSelectedClassId('');
+
+      // Fetch student's current class enrollment
+      ApiService.getStudentEnrollments(studentToEdit.id)
+        .then((enrs) => {
+          if (enrs && enrs.length > 0) {
+            setSelectedClassId(enrs[0]);
+          }
+        })
+        .catch(() => {});
     } else {
       // Defaults for new student
       setFullName('');
@@ -107,6 +116,39 @@ export const StudentFormModal: React.FC<StudentFormModalProps> = ({
     setErrorMessage('');
     setUploadProgress(0);
   }, [studentToEdit, isOpen]);
+
+  const handleClassSelect = (classId: string) => {
+    setSelectedClassId(classId);
+    if (classId) {
+      const cls = classes.find((c) => c.id === classId);
+      if (cls) {
+        if (!studentToEdit) {
+          setCourse(cls.name);
+          setSection(cls.section ? `Section ${cls.section}` : section);
+          if (cls.academic_year) {
+            setAcademicYear(cls.academic_year);
+          }
+        }
+      }
+    }
+  };
+
+  const handleCourseChange = (newCourse: string) => {
+    setCourse(newCourse);
+    if (!selectedClassId && newCourse.trim()) {
+      const q = newCourse.trim().toLowerCase();
+      const match = classes.find(
+        (c) =>
+          c.name.toLowerCase() === q ||
+          c.code.toLowerCase() === q ||
+          c.name.toLowerCase().includes(q) ||
+          q.includes(c.name.toLowerCase())
+      );
+      if (match) {
+        setSelectedClassId(match.id);
+      }
+    }
+  };
 
   if (!isOpen) return null;
 
@@ -406,24 +448,37 @@ export const StudentFormModal: React.FC<StudentFormModalProps> = ({
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div className="sm:col-span-2">
               <label className="block text-xs font-semibold text-slate-700 mb-1.5">
-                Assign to Class / Course <span className="text-slate-400 font-normal">(Auto-enroll for attendance)</span>
+                Assign to Class / Course <span className="text-slate-400 font-normal">(Enrolls student for attendance)</span>
               </label>
               <select
                 value={selectedClassId}
-                onChange={(e) => setSelectedClassId(e.target.value)}
+                onChange={(e) => handleClassSelect(e.target.value)}
                 disabled={isSubmitting}
                 className="w-full px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500 transition"
               >
-                <option value="">-- None (Directory Only / Enroll Later) --</option>
+                <option value="">-- None (Directory Only / Unassigned) --</option>
                 {classes.map((c) => (
                   <option key={c.id} value={c.id}>
                     {c.name} ({c.code} - Sec {c.section})
                   </option>
                 ))}
               </select>
-              <span className="text-[10px] text-slate-400 mt-1 block">
-                Enrolling the student links them directly to the active class roster and attendance sessions.
-              </span>
+              {selectedClassId ? (
+                <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-emerald-700 font-medium">
+                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                  <span>
+                    Student will be enrolled in{' '}
+                    <strong>{classes.find((c) => c.id === selectedClassId)?.name}</strong> and appear on its attendance roster.
+                  </span>
+                </div>
+              ) : (
+                <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-amber-700 font-medium">
+                  <AlertCircle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                  <span>
+                    No class assigned: Student will remain in the directory only and will not appear in lecture attendance sessions until enrolled.
+                  </span>
+                </div>
+              )}
             </div>
 
             <div>
@@ -434,7 +489,7 @@ export const StudentFormModal: React.FC<StudentFormModalProps> = ({
                 type="text"
                 required
                 value={course}
-                onChange={(e) => setCourse(e.target.value)}
+                onChange={(e) => handleCourseChange(e.target.value)}
                 placeholder="e.g. B.Tech Computer Science"
                 disabled={isSubmitting}
                 className="w-full px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500 transition"

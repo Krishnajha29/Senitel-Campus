@@ -384,34 +384,40 @@ export class ApiService {
 
   static async updateStudent(
     id: string,
-    updates: Partial<Student>,
+    updates: Partial<Student> & { class_id?: string },
     newPhotoFile?: File,
     onProgress?: (pct: number) => void
   ): Promise<Student> {
     const instructor = await this.getCurrentInstructor();
     if (!instructor) throw new Error('Not authenticated');
 
-    if (updates.roll_number) {
-      const cleanRoll = updates.roll_number.trim().toUpperCase();
+    const targetClassId = updates.class_id;
+    // Strip non-column fields before updating students table
+    const { class_id: _, photo_url: _purl, ...cleanUpdates } = updates as any;
+
+    if (cleanUpdates.roll_number) {
+      const cleanRoll = cleanUpdates.roll_number.trim().toUpperCase();
       const exists = await this.checkRollNumberExists(cleanRoll, id);
       if (exists) {
         throw new Error(`This roll number already exists (${cleanRoll}).`);
       }
-      updates.roll_number = cleanRoll;
+      cleanUpdates.roll_number = cleanRoll;
     }
 
     let photoUrl = updates.photo_url;
     if (newPhotoFile) {
       const uploadRes = await uploadStudentPhoto(newPhotoFile, instructor.id, onProgress);
-      updates.photo_path = uploadRes.photoPath;
+      cleanUpdates.photo_path = uploadRes.photoPath;
       photoUrl = uploadRes.photoUrl;
     }
+
+    let updatedStudent: Student;
 
     if (isSupabaseConfigured()) {
       const { data, error } = await supabase
         .from('students')
         .update({
-          ...updates,
+          ...cleanUpdates,
           updated_at: new Date().toISOString(),
         })
         .eq('id', id)
@@ -426,17 +432,58 @@ export class ApiService {
         throw new Error(`Update failed: ${error.message}`);
       }
 
-      return {
+      updatedStudent = {
         ...(data as Student),
         photo_url: photoUrl || (await getStudentPhotoUrl(data.photo_path)),
       };
+
+      // Handle class enrollment updates
+      if (targetClassId !== undefined) {
+        try {
+          const currentEnrs = await this.getStudentEnrollments(id);
+          if (targetClassId && !currentEnrs.includes(targetClassId)) {
+            // Remove previous enrollment if single-class model
+            for (const oldClassId of currentEnrs) {
+              await this.removeStudentFromClass(oldClassId, id);
+            }
+            // Enroll in new class
+            await this.enrollStudentsInClass(targetClassId, [id]);
+
+            // Populate baseline record if an active attendance session is running
+            const { data: activeSessions } = await supabase
+              .from('attendance_sessions')
+              .select('id')
+              .eq('class_id', targetClassId)
+              .eq('status', 'active');
+
+            if (activeSessions && activeSessions.length > 0) {
+              const newRecords = activeSessions.map((ses) => ({
+                session_id: ses.id,
+                student_id: id,
+                status: 'unmarked',
+                marked_by: instructor.id,
+                method: 'manual',
+              }));
+              await supabase.from('attendance_records').upsert(newRecords, { onConflict: 'session_id,student_id' });
+            }
+          } else if (targetClassId === '' && currentEnrs.length > 0) {
+            for (const oldClassId of currentEnrs) {
+              await this.removeStudentFromClass(oldClassId, id);
+            }
+          }
+        } catch (enrErr) {
+          console.warn('Class enrollment update warning:', enrErr);
+        }
+      }
+
+      return updatedStudent;
     }
 
-    const updated = LocalDatabase.updateStudent(id, {
+    updatedStudent = LocalDatabase.updateStudent(id, {
       ...updates,
       photo_url: photoUrl,
     });
-    return updated;
+    return updatedStudent;
   }
 
   static async toggleStudentStatus(id: string, isActive: boolean): Promise<Student> {
@@ -566,17 +613,26 @@ export class ApiService {
         .select('student_id, students(*)')
         .eq('class_id', classId);
 
-      if (error || !data) return [];
+      if (error) {
+        console.error('Error fetching class enrollments from Supabase:', error);
+        throw new Error(`Database error loading class enrollments: ${error.message}`);
+      }
+
+      if (!data || data.length === 0) return [];
       let students = data.map((d: any) => d.students).filter(Boolean) as Student[];
 
       // Fallback: If join returned empty students but enrollment rows exist, query students by ID
       if (students.length === 0 && data.length > 0) {
         const studentIds = data.map((d: any) => d.student_id).filter(Boolean);
         if (studentIds.length > 0) {
-          const { data: directStudents } = await supabase
+          const { data: directStudents, error: directErr } = await supabase
             .from('students')
             .select('*')
             .in('id', studentIds);
+          if (directErr) {
+            console.error('Direct student fallback query error:', directErr);
+            throw new Error(`Failed to load student profiles: ${directErr.message}`);
+          }
           if (directStudents) {
             students = directStudents as Student[];
           }
@@ -598,6 +654,24 @@ export class ApiService {
         photo_url: s.photo_url || (await getStudentPhotoUrl(s.photo_path)),
       }))
     );
+  }
+
+  static async getStudentEnrollments(studentId: string): Promise<string[]> {
+    if (isSupabaseConfigured()) {
+      const { data, error } = await supabase
+        .from('class_enrollments')
+        .select('class_id')
+        .eq('student_id', studentId);
+
+      if (error) {
+        console.error('Error fetching student enrollments:', error);
+        return [];
+      }
+
+      return (data || []).map((d: any) => d.class_id).filter(Boolean);
+    }
+
+    return LocalDatabase.getStudentEnrollments(studentId);
   }
 
   static async enrollStudentsInClass(classId: string, studentIds: string[]): Promise<void> {
@@ -631,6 +705,67 @@ export class ApiService {
     }
 
     LocalDatabase.removeStudentFromClass(classId, studentId);
+  }
+
+  /**
+   * Safe Repair Workflow:
+   * Inspects existing registered students who have missing enrollment records.
+   * Matches student course text against class names or codes confidently and auto-enrolls them.
+   */
+  static async repairClassEnrollments(
+    targetClassId?: string
+  ): Promise<{ repairedCount: number; repairedStudents: Student[] }> {
+    const instructor = await this.getCurrentInstructor();
+    if (!instructor) throw new Error('Not authenticated');
+
+    const [allStudents, allClasses] = await Promise.all([
+      this.getStudents(),
+      this.getClasses(),
+    ]);
+
+    const activeClasses = allClasses.filter((c) => c.is_active);
+    const classesToMatch = targetClassId
+      ? activeClasses.filter((c) => c.id === targetClassId)
+      : activeClasses;
+
+    if (classesToMatch.length === 0) {
+      return { repairedCount: 0, repairedStudents: [] };
+    }
+
+    const repairedStudents: Student[] = [];
+
+    for (const student of allStudents) {
+      const enrolledClassIds = await this.getStudentEnrollments(student.id);
+      if (enrolledClassIds.length > 0) continue; // Already enrolled
+
+      const studentCourse = (student.course || '').trim().toLowerCase();
+      const studentBatch = (student.batch || '').trim().toLowerCase();
+
+      // Find unambiguous matching class
+      const matchingClasses = classesToMatch.filter((cls) => {
+        const clsName = cls.name.trim().toLowerCase();
+        const clsCode = cls.code.trim().toLowerCase();
+        return (
+          studentCourse === clsName ||
+          studentCourse === clsCode ||
+          clsName.includes(studentCourse) ||
+          studentCourse.includes(clsName) ||
+          studentBatch.includes(clsName) ||
+          studentBatch.includes(clsCode)
+        );
+      });
+
+      if (matchingClasses.length === 1) {
+        const targetClass = matchingClasses[0];
+        await this.enrollStudentsInClass(targetClass.id, [student.id]);
+        repairedStudents.push(student);
+      }
+    }
+
+    return {
+      repairedCount: repairedStudents.length,
+      repairedStudents,
+    };
   }
 
   // -------------------------------------------------------------

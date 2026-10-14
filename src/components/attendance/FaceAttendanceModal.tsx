@@ -23,16 +23,20 @@ import {
   XCircle,
   Layers,
   AlertTriangle,
+  AlertCircle,
+  UserPlus,
 } from 'lucide-react';
 import type {
   AttendanceSession,
   FaceScanSessionSummary,
   Student,
   PhotoUploadSession,
+  ClassCourse,
 } from '../../types';
 import { FaceRecognitionService } from '../../services/faceRecognition';
 import { ApiService } from '../../services/api';
 import { useToast } from '../common/ToastContext';
+import { ClassRosterModal } from '../classes/ClassRosterModal';
 import QRCode from 'qrcode';
 
 interface FaceAttendanceModalProps {
@@ -94,10 +98,166 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
   const [resolvedReviewMap, setResolvedReviewMap] = useState<Map<string, string>>(new Map()); // detectionId -> studentId
   const [manualPresentIds, setManualPresentIds] = useState<Set<string>>(new Set());
 
-  // Enrolled students with face descriptors
-  const enrolledWithFaces = enrolledStudents.filter(
+  // Live Class Roster & Diagnostic State
+  const [liveEnrolledStudents, setLiveEnrolledStudents] = useState<Student[]>(enrolledStudents || []);
+  const [hasLoadedRoster, setHasLoadedRoster] = useState<boolean>(false);
+  const [classObj, setClassObj] = useState<ClassCourse | null>(null);
+  const [rosterLoading, setRosterLoading] = useState<boolean>(false);
+  const [rosterState, setRosterState] = useState<'loading' | 'ready' | 'empty' | 'unauthorized' | 'db_error'>('loading');
+  const [rosterErrorMessage, setRosterErrorMessage] = useState<string | null>(null);
+  const [matchingDirectoryCandidates, setMatchingDirectoryCandidates] = useState<Student[]>([]);
+  const [isEnrollingMatching, setIsEnrollingMatching] = useState<boolean>(false);
+  const [isClassRosterModalOpen, setIsClassRosterModalOpen] = useState<boolean>(false);
+  const [isExtractingBiometrics, setIsExtractingBiometrics] = useState<boolean>(false);
+
+  const effectiveRoster = hasLoadedRoster ? liveEnrolledStudents : (enrolledStudents && enrolledStudents.length > 0 ? enrolledStudents : liveEnrolledStudents);
+
+  // Enrolled students with valid 128-d face descriptors
+  const enrolledWithFaces = effectiveRoster.filter(
     (s) => s.face_descriptor && Array.isArray(s.face_descriptor) && s.face_descriptor.length === 128
   );
+
+  // Enrolled students with photos but missing 128-d face embedding
+  const enrolledNeedingBiometrics = effectiveRoster.filter(
+    (s) =>
+      (!s.face_descriptor || !Array.isArray(s.face_descriptor) || s.face_descriptor.length !== 128) &&
+      (s.photo_url || s.photo_path)
+  );
+
+  const loadClassRoster = useCallback(async () => {
+    if (!session?.class_id) return;
+    setRosterLoading(true);
+    setRosterErrorMessage(null);
+    try {
+      const [classDetails, enrolled, allDirStudents] = await Promise.all([
+        ApiService.getClassById(session.class_id),
+        ApiService.getClassEnrollments(session.class_id),
+        ApiService.getStudents({ is_active: true }).catch(() => []),
+      ]);
+      setClassObj(classDetails);
+      setLiveEnrolledStudents(enrolled);
+      setHasLoadedRoster(true);
+
+      if (enrolled.length === 0) {
+        setRosterState('empty');
+        const targetName = (session.class_name || classDetails?.name || '').trim().toLowerCase();
+        const targetCode = (session.class_code || classDetails?.code || '').trim().toLowerCase();
+        const matching = allDirStudents.filter((s) => {
+          const sc = (s.course || '').trim().toLowerCase();
+          const sb = (s.batch || '').trim().toLowerCase();
+          return (
+            (targetName &&
+              (sc === targetName ||
+                sc.includes(targetName) ||
+                targetName.includes(sc) ||
+                sb.includes(targetName))) ||
+            (targetCode &&
+              (sc === targetCode ||
+                sc.includes(targetCode) ||
+                sb.includes(targetCode)))
+          );
+        });
+        setMatchingDirectoryCandidates(matching);
+      } else {
+        setRosterState('ready');
+      }
+    } catch (err: any) {
+      console.error('Failed to load roster in FaceAttendanceModal:', err);
+      const msg = err.message || '';
+      if (
+        msg.includes('permission denied') ||
+        msg.includes('401') ||
+        msg.includes('403') ||
+        msg.includes('JWT') ||
+        msg.includes('Unauthorized') ||
+        msg.includes('unauthorized')
+      ) {
+        setRosterState('unauthorized');
+        setRosterErrorMessage(msg);
+      } else {
+        setRosterState('db_error');
+        setRosterErrorMessage(msg);
+      }
+      setHasLoadedRoster(true);
+    } finally {
+      setRosterLoading(false);
+    }
+  }, [session?.class_id, session?.class_name, session?.class_code]);
+
+  useEffect(() => {
+    if (isOpen) {
+      loadClassRoster();
+    }
+  }, [isOpen, loadClassRoster]);
+
+  const handleAutoEnrollMatching = async () => {
+    if (!session?.class_id || matchingDirectoryCandidates.length === 0) return;
+    try {
+      setIsEnrollingMatching(true);
+      const ids = matchingDirectoryCandidates.map((s) => s.id);
+      await ApiService.enrollStudentsInClass(session.class_id, ids);
+      toast.success(
+        'Auto-Enrollment Complete',
+        `Successfully enrolled ${ids.length} matching students in ${session.class_name || 'this class'}.`
+      );
+      await loadClassRoster();
+      onAttendanceSubmitted();
+    } catch (err: any) {
+      toast.error('Auto-Enrollment Failed', err.message);
+    } finally {
+      setIsEnrollingMatching(false);
+    }
+  };
+
+  const handleExtractMissingBiometrics = async () => {
+    if (enrolledNeedingBiometrics.length === 0) return;
+    setIsExtractingBiometrics(true);
+    toast.info(
+      'Analyzing Photos',
+      `Extracting 128-d face biometrics for ${enrolledNeedingBiometrics.length} student(s)...`
+    );
+
+    try {
+      await FaceRecognitionService.loadModels();
+      let extractedCount = 0;
+      for (const student of enrolledNeedingBiometrics) {
+        const photoUrl = student.photo_url || student.photo_path;
+        if (!photoUrl) continue;
+        try {
+          const img = await FaceRecognitionService.loadImageElement(photoUrl);
+          const res = await FaceRecognitionService.validateAndExtractReferenceDescriptor(img);
+          if (res.valid && res.descriptor) {
+            await ApiService.enrollStudentFaceDescriptor(
+              student.id,
+              res.descriptor,
+              res.qualityScore || 0.95
+            );
+            extractedCount++;
+          }
+        } catch (err) {
+          console.warn(`Extraction error for ${student.full_name}:`, err);
+        }
+      }
+
+      if (extractedCount > 0) {
+        toast.success(
+          'Biometrics Enrolled',
+          `Extracted and persisted 128-d vectors for ${extractedCount} student(s).`
+        );
+        await loadClassRoster();
+        onAttendanceSubmitted();
+      } else {
+        toast.info(
+          'Verification Finished',
+          'Could not detect single clear face features in registered photos.'
+        );
+      }
+    } catch (err: any) {
+      toast.error('Biometric Extraction Failed', err.message);
+    } finally {
+      setIsExtractingBiometrics(false);
+    }
+  };
 
   // -------------------------------------------------------------
   // QR Upload Session Management & Auto-Init
@@ -560,7 +720,7 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
 
       const summary = await FaceRecognitionService.processMultiPhotoClassroomBatch(
         photosToProcess,
-        enrolledStudents,
+        effectiveRoster,
         session.id,
         (prog) => {
           setBatchProgress({
@@ -760,7 +920,8 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
                 </span>
               </h3>
               <p className="text-xs text-slate-300">
-                {session.title} &bull; {session.class_code || 'CS201'} &bull; {enrolledStudents.length} enrolled students
+                {session.title} &bull; {session.class_name || session.class_code || 'CS201'} &bull;{' '}
+                <span className="font-semibold text-white">{effectiveRoster.length} enrolled students</span>
               </p>
             </div>
           </div>
@@ -779,37 +940,179 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
         {/* Step 1 & 2: QR Capture View / Upload & Preview */}
         {(currentStep === 'capture' || currentStep === 'preview') && (
           <div className="p-6 flex-1 overflow-y-auto space-y-6">
-            {/* Enrollment Status Notice */}
-            {enrolledStudents.length === 0 ? (
-              <div className="p-4 rounded-2xl bg-rose-50 border-2 border-rose-300 flex items-start gap-3.5 text-xs text-rose-950 shadow-sm animate-pulse">
+            {/* Enrollment Status Notice & Diagnostics */}
+            {rosterLoading ? (
+              <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200 flex items-center gap-3 text-xs text-slate-600">
+                <Loader2 className="w-5 h-5 text-brand-600 animate-spin shrink-0" />
+                <span>Querying enrolled class roster from database...</span>
+              </div>
+            ) : rosterState === 'unauthorized' ? (
+              <div className="p-4 rounded-2xl bg-rose-50 border-2 border-rose-300 flex items-start gap-3.5 text-xs text-rose-950 shadow-sm">
                 <ShieldAlert className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
-                <div className="space-y-1">
+                <div className="space-y-1.5 flex-1">
                   <p className="font-bold text-rose-900 text-sm">
-                    Class Roster Empty (0 Enrolled Students)
+                    Roster Request Unauthorized (RLS / Auth Policy)
                   </p>
                   <p className="text-rose-800 leading-relaxed">
-                    This lecture belongs to class <strong>{session.class_name || session.class_code || 'selected class'}</strong>, which currently has zero enrolled students. Face recognition matches detected faces against enrolled students; without a roster, no student can be identified.
+                    PostgreSQL Row Level Security prevented reading student enrollments for this class. Please ensure your instructor account owns this class.
                   </p>
-                  <p className="text-[11px] text-rose-700 font-medium pt-0.5">
-                    Please enroll students in this class from the <strong>Classes &amp; Courses &rarr; Class Roster</strong> page or register new students with this class assigned before scanning faces.
+                  {rosterErrorMessage && (
+                    <p className="text-[11px] font-mono bg-rose-100 p-2 rounded-lg text-rose-900">
+                      {rosterErrorMessage}
+                    </p>
+                  )}
+                  <button
+                    type="button"
+                    onClick={loadClassRoster}
+                    className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-xl text-xs transition cursor-pointer"
+                  >
+                    Retry Query
+                  </button>
+                </div>
+              </div>
+            ) : rosterState === 'db_error' ? (
+              <div className="p-4 rounded-2xl bg-rose-50 border-2 border-rose-300 flex items-start gap-3.5 text-xs text-rose-950 shadow-sm">
+                <AlertCircle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
+                <div className="space-y-1.5 flex-1">
+                  <p className="font-bold text-rose-900 text-sm">
+                    Database Query Failed
                   </p>
+                  <p className="text-rose-800 leading-relaxed">
+                    Could not retrieve class enrollments due to an unexpected database error:
+                  </p>
+                  {rosterErrorMessage && (
+                    <p className="text-[11px] font-mono bg-rose-100 p-2 rounded-lg text-rose-900">
+                      {rosterErrorMessage}
+                    </p>
+                  )}
+                  <button
+                    type="button"
+                    onClick={loadClassRoster}
+                    className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-xl text-xs transition cursor-pointer"
+                  >
+                    Retry Query
+                  </button>
+                </div>
+              </div>
+            ) : effectiveRoster.length === 0 ? (
+              <div className="p-4 rounded-2xl bg-rose-50 border-2 border-rose-300 flex items-start gap-3.5 text-xs text-rose-950 shadow-sm">
+                <ShieldAlert className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
+                <div className="space-y-2 flex-1">
+                  <div>
+                    <p className="font-bold text-rose-900 text-sm">
+                      Class Roster Empty (0 Enrolled Students)
+                    </p>
+                    <p className="text-rose-800 leading-relaxed mt-0.5">
+                      This lecture belongs to class <strong>{session.class_name || session.class_code || 'selected class'}</strong>, which currently has zero enrolled students. Face recognition matches detected faces against enrolled students; without a roster, no student can be identified.
+                    </p>
+                  </div>
+
+                  {/* 1-Click Auto-Enroll matching students banner */}
+                  {matchingDirectoryCandidates.length > 0 && (
+                    <div className="p-3 bg-white/90 border border-brand-300 rounded-xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2.5">
+                      <div className="flex items-center gap-2">
+                        <Sparkles className="w-4 h-4 text-brand-600 shrink-0" />
+                        <span className="text-xs text-brand-900 font-semibold">
+                          Found {matchingDirectoryCandidates.length} registered student(s) matching "{session.class_name || 'this class'}" in your directory.
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={handleAutoEnrollMatching}
+                        disabled={isEnrollingMatching}
+                        className="px-3 py-1.5 bg-brand-600 hover:bg-brand-700 text-white font-bold text-xs rounded-lg transition shadow-xs cursor-pointer shrink-0 disabled:opacity-50"
+                      >
+                        {isEnrollingMatching ? (
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin inline mr-1" />
+                        ) : null}
+                        Auto-Enroll All {matchingDirectoryCandidates.length}
+                      </button>
+                    </div>
+                  )}
+
+                  <div className="flex flex-wrap items-center gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => setIsClassRosterModalOpen(true)}
+                      className="px-3.5 py-1.5 bg-white border border-rose-300 hover:bg-rose-100 text-rose-900 font-bold text-xs rounded-xl transition shadow-xs flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <UserPlus className="w-3.5 h-3.5 text-rose-700" />
+                      Manage Class Roster &amp; Enroll Students
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={loadClassRoster}
+                      className="px-3 py-1.5 bg-white/80 border border-slate-300 hover:bg-white text-slate-700 font-semibold text-xs rounded-xl transition cursor-pointer flex items-center gap-1"
+                    >
+                      <RefreshCw className="w-3 h-3 text-slate-500" />
+                      Refresh Roster
+                    </button>
+                  </div>
                 </div>
               </div>
             ) : enrolledWithFaces.length === 0 ? (
-              <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-300 flex items-start gap-3 text-xs text-amber-950">
-                <ShieldAlert className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-                <div>
-                  <span className="font-bold text-amber-900">Biometric Enrollment Notice: </span>
-                  0 of {enrolledStudents.length} enrolled students have biometric face representations registered. You can still process photos to detect faces, but matching will require manual instructor confirmation in the review tab.
+              <div className="p-4 rounded-2xl bg-amber-50 border border-amber-300 flex items-start gap-3.5 text-xs text-amber-950">
+                <ShieldAlert className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                <div className="space-y-2 flex-1">
+                  <div>
+                    <span className="font-bold text-amber-900 text-sm">Biometric Enrollment Notice: </span>
+                    <p className="mt-0.5">
+                      0 of {effectiveRoster.length} enrolled students have 128-d biometric face vectors registered. You can still scan classroom photos to detect faces, but automated matching requires registered embeddings.
+                    </p>
+                  </div>
+
+                  {enrolledNeedingBiometrics.length > 0 && (
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={handleExtractMissingBiometrics}
+                        disabled={isExtractingBiometrics}
+                        className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs rounded-xl transition shadow-xs flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                      >
+                        {isExtractingBiometrics ? (
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Sparkles className="w-3.5 h-3.5" />
+                        )}
+                        Extract 128-d Vectors from Photos ({enrolledNeedingBiometrics.length})
+                      </button>
+                    </div>
+                  )}
                 </div>
               </div>
             ) : (
-              <div className="p-3.5 rounded-2xl bg-emerald-50 border border-emerald-300 flex items-start gap-3 text-xs text-emerald-950">
-                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                <div>
-                  <span className="font-bold text-emerald-900">Roster Enrollment Status: </span>
-                  {enrolledWithFaces.length} of {enrolledStudents.length} enrolled students have registered face representations ready for automated matching.
+              <div className="p-3.5 rounded-2xl bg-emerald-50 border border-emerald-300 flex items-start justify-between gap-3 text-xs text-emerald-950">
+                <div className="flex items-start gap-3">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                  <div>
+                    <span className="font-bold text-emerald-900">Roster Enrollment Status: </span>
+                    <span>
+                      {enrolledWithFaces.length} of {effectiveRoster.length} enrolled students have verified 128-d face representations ready for automated recognition.
+                    </span>
+                    {enrolledNeedingBiometrics.length > 0 && (
+                      <div className="mt-1">
+                        <button
+                          type="button"
+                          onClick={handleExtractMissingBiometrics}
+                          disabled={isExtractingBiometrics}
+                          className="text-[11px] font-bold text-indigo-700 hover:text-indigo-900 underline flex items-center gap-1 cursor-pointer"
+                        >
+                          <Sparkles className="w-3 h-3" />
+                          Extract biometrics for remaining {enrolledNeedingBiometrics.length} photo(s)
+                        </button>
+                      </div>
+                    )}
+                  </div>
                 </div>
+
+                <button
+                  type="button"
+                  onClick={() => setIsClassRosterModalOpen(true)}
+                  className="px-2.5 py-1 text-[11px] font-bold text-emerald-800 bg-white border border-emerald-300 rounded-lg hover:bg-emerald-100 transition shrink-0 cursor-pointer"
+                >
+                  View Roster
+                </button>
               </div>
             )}
 
@@ -894,15 +1197,15 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
                         <button
                           type="button"
                           onClick={processClassroomPhoto}
-                          disabled={enrolledStudents.length === 0}
+                          disabled={effectiveRoster.length === 0}
                           className={`w-full sm:w-auto px-6 py-2.5 rounded-xl text-white text-xs font-bold flex items-center justify-center gap-2 shadow-md transition ${
-                            enrolledStudents.length === 0
+                            effectiveRoster.length === 0
                               ? 'bg-slate-400 cursor-not-allowed opacity-60'
                               : 'bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 hover:scale-[1.02] cursor-pointer'
                           }`}
                         >
                           <Sparkles className="w-4 h-4" />
-                          {enrolledStudents.length === 0
+                          {effectiveRoster.length === 0
                             ? 'Cannot Match Faces (Roster Empty)'
                             : receivedPhotos.length > 1
                             ? `Proceed to Face Recognition (${receivedPhotos.length} Photos)`
@@ -1225,7 +1528,7 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
                   </div>
                 </div>
 
-                {enrolledStudents.length === 0 && (
+                {effectiveRoster.length === 0 && (
                   <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 text-xs flex items-center gap-2">
                     <AlertTriangle className="w-4 h-4 shrink-0 text-amber-600" />
                     <span>
@@ -1247,9 +1550,9 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
                   <button
                     type="button"
                     onClick={processClassroomPhoto}
-                    disabled={enrolledStudents.length === 0}
+                    disabled={effectiveRoster.length === 0}
                     className={`w-full sm:w-auto px-6 py-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-2 shadow-sm transition ${
-                      enrolledStudents.length === 0
+                      effectiveRoster.length === 0
                         ? 'bg-slate-200 text-slate-400 border border-slate-300 cursor-not-allowed opacity-75'
                         : 'bg-brand-600 hover:bg-brand-700 text-white hover:scale-[1.02] active:scale-[0.98] cursor-pointer'
                     }`}
@@ -1741,6 +2044,17 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
           </div>
         )}
       </div>
+
+      {isClassRosterModalOpen && classObj && (
+        <ClassRosterModal
+          isOpen={isClassRosterModalOpen}
+          classObj={classObj}
+          onClose={() => setIsClassRosterModalOpen(false)}
+          onRosterUpdated={() => {
+            loadClassRoster();
+          }}
+        />
+      )}
     </div>
   );
 };
