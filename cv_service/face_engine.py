@@ -142,7 +142,17 @@ async def process_classroom_photo(
     roster_data = json.loads(roster_json)
     contents = await file.read()
     image = Image.open(io.BytesIO(contents)).convert("RGB")
-    np_img = np.array(image)
+
+    scale = 1.0
+    max_dim = max(image.size)
+    if max_dim > 1600:
+        scale = 1600.0 / max_dim
+        new_w = int(image.size[0] * scale)
+        new_h = int(image.size[1] * scale)
+        image_resized = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        np_img = np.array(image_resized)
+    else:
+        np_img = np.array(image)
 
     if CV_AVAILABLE:
         face_boxes = face_recognition.face_locations(np_img, model="hog")
@@ -170,6 +180,11 @@ async def process_classroom_photo(
 
     for i, (box, enc) in enumerate(zip(face_boxes, encodings)):
         top, right, bottom, left = box
+        if scale != 1.0:
+            top = int(top / scale)
+            right = int(right / scale)
+            bottom = int(bottom / scale)
+            left = int(left / scale)
         box_dict = {"x": left, "y": top, "width": right - left, "height": bottom - top}
 
         candidates = []

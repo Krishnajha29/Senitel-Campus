@@ -88,6 +88,16 @@ export const uploadStudentPhoto = async (
 export const getStudentPhotoUrl = async (photoPath: string): Promise<string> => {
   if (!photoPath) return '';
 
+  // Fast-track existing full URLs or data URLs without hitting storage API
+  if (
+    photoPath.startsWith('http://') ||
+    photoPath.startsWith('https://') ||
+    photoPath.startsWith('data:') ||
+    photoPath.startsWith('blob:')
+  ) {
+    return photoPath;
+  }
+
   if (isSupabaseConfigured()) {
     const { data, error } = await supabase.storage
       .from(BUCKET_NAME)
@@ -103,8 +113,8 @@ export const getStudentPhotoUrl = async (photoPath: string): Promise<string> => 
     if (blob) {
       return URL.createObjectURL(blob);
     }
-    // If it's a seed avatar or external fallback path
-    if (photoPath.startsWith('http') || photoPath.startsWith('/')) {
+    // If it's a seed avatar or local fallback path
+    if (photoPath.startsWith('/')) {
       return photoPath;
     }
     return '';

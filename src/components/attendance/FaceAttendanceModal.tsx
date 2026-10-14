@@ -22,6 +22,7 @@ import {
   CheckCircle,
   XCircle,
   Layers,
+  AlertTriangle,
 } from 'lucide-react';
 import type {
   AttendanceSession,
@@ -69,12 +70,16 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
   const [isRevokingQr, setIsRevokingQr] = useState<boolean>(false);
   const [copiedLink, setCopiedLink] = useState<boolean>(false);
 
-  // Camera state (optional fallback)
+  // Camera state (Laptop webcam & device camera)
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [cameraError, setCameraError] = useState<string | null>(null);
-  const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment');
+  const [isCameraInitializing, setIsCameraInitializing] = useState<boolean>(false);
+  const [isCameraReady, setIsCameraReady] = useState<boolean>(false);
+  const [isCapturing, setIsCapturing] = useState<boolean>(false);
+  const [facingMode, setFacingMode] = useState<'environment' | 'user'>('user');
   const [capturedImage, setCapturedImage] = useState<string | null>(null);
   const [receivedPhotos, setReceivedPhotos] = useState<{ id: string; name: string; url: string; size?: number }[]>([]);
   const [batchProgress, setBatchProgress] = useState<{ current: number; total: number; percent: number; photoName: string } | null>(null);
@@ -280,55 +285,143 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
   };
 
   // -------------------------------------------------------------
-  // Camera Stream Management (Webcam fallback)
+  // Camera Stream Management (Laptop webcam & device camera)
   // -------------------------------------------------------------
-  const startCamera = useCallback(async () => {
+  const stopCamera = useCallback(() => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => {
+        try {
+          track.stop();
+        } catch {}
+      });
+      streamRef.current = null;
+    }
+    setStream(null);
+    setIsCameraReady(false);
+    setIsCameraInitializing(false);
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+  }, []);
+
+  const startCamera = useCallback(async (mode?: 'environment' | 'user') => {
+    const targetMode = mode || facingMode;
     setCameraError(null);
-    if (stream) {
-      stream.getTracks().forEach((t) => t.stop());
+    setIsCameraReady(false);
+    setIsCameraInitializing(true);
+
+    // Stop existing stream first to avoid hardware resource contention
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
+
+    // 1. Insecure context check on remote deployments
+    if (
+      typeof window !== 'undefined' &&
+      window.isSecureContext === false &&
+      window.location.hostname !== 'localhost' &&
+      window.location.hostname !== '127.0.0.1'
+    ) {
+      setCameraError(
+        'Camera access requires a secure HTTPS connection or localhost. Please access Sentinel Campus over HTTPS or upload a photo instead.'
+      );
+      setIsCameraInitializing(false);
+      return;
+    }
+
+    // 2. Browser API support check
+    if (!navigator?.mediaDevices?.getUserMedia) {
+      setCameraError(
+        'The camera API (navigator.mediaDevices.getUserMedia) is not supported by your current browser or device. Please upload a classroom photo instead.'
+      );
+      setIsCameraInitializing(false);
+      return;
     }
 
     try {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        throw new Error('Camera access is not supported on this browser/device.');
+      let mediaStream: MediaStream;
+      try {
+        // Try requested resolution and facing mode
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: targetMode },
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+          },
+          audio: false,
+        });
+      } catch (constraintErr: any) {
+        console.warn('Overconstrained video constraints fallback:', constraintErr);
+        // Fallback to unconstrained video
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: false,
+        });
       }
 
-      const mediaStream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: { ideal: facingMode },
-          width: { ideal: 1920 },
-          height: { ideal: 1080 },
-        },
-        audio: false,
-      });
+      // Verify active video track
+      const videoTracks = mediaStream.getVideoTracks();
+      if (!videoTracks || videoTracks.length === 0 || videoTracks[0].readyState === 'ended') {
+        throw new Error('Camera stream does not contain any active video tracks.');
+      }
 
+      streamRef.current = mediaStream;
       setStream(mediaStream);
+
+      // Attach stream to video element
       if (videoRef.current) {
-        videoRef.current.srcObject = mediaStream;
+        const video = videoRef.current;
+        video.srcObject = mediaStream;
+        video.muted = true;
+        video.playsInline = true;
+
+        video.onloadedmetadata = async () => {
+          try {
+            await video.play();
+            // Verify nonzero dimensions
+            if (video.videoWidth > 0 && video.videoHeight > 0) {
+              setIsCameraReady(true);
+              setIsCameraInitializing(false);
+            } else {
+              video.oncanplay = () => {
+                setIsCameraReady(true);
+                setIsCameraInitializing(false);
+              };
+            }
+          } catch (playErr: any) {
+            console.warn('Autoplay prevented:', playErr);
+            setCameraError(
+              'Camera stream is active, but video playback was prevented by your browser. Click anywhere on the video preview to resume, or upload a photo.'
+            );
+            setIsCameraInitializing(false);
+          }
+        };
+      } else {
+        setIsCameraInitializing(false);
       }
     } catch (err: any) {
       console.warn('Camera initialization error:', err);
       let msg = 'Could not access camera. Please check camera permissions or upload a classroom photo.';
       if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-        msg = 'Camera permission was denied. Please allow camera access in browser settings or use file upload.';
+        msg =
+          'Camera permission was denied. Please allow camera permissions in your browser address bar (lock/tune icon) or operating system settings, then click Retry Camera.';
       } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
-        msg = 'No camera device found on this system. Please upload a photo instead.';
+        msg =
+          'No camera hardware detected on this device. Please connect a webcam or upload a classroom photo instead.';
+      } else if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
+        msg =
+          'Camera is already in use by another application or browser tab. Please close other camera apps and click Retry Camera.';
+      } else if (err.name === 'OverconstrainedError') {
+        msg = 'The requested camera resolution is not supported by your camera hardware. Please upload a photo instead.';
       }
       setCameraError(msg);
+      setIsCameraInitializing(false);
+      setIsCameraReady(false);
     }
-  }, [facingMode, stream]);
+  }, [facingMode]);
 
-  const stopCamera = useCallback(() => {
-    if (stream) {
-      stream.getTracks().forEach((t) => t.stop());
-      setStream(null);
-    }
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
-  }, [stream]);
-
-  // Manage webcam stream only when captureSource is 'webcam'
+  // Manage webcam stream on step/source changes
   useEffect(() => {
     if (isOpen && currentStep === 'capture' && captureSource === 'webcam' && !capturedImage) {
       startCamera();
@@ -340,25 +433,67 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
     };
   }, [isOpen, currentStep, captureSource, capturedImage, startCamera, stopCamera]);
 
+  // Attach stream to video element when it mounts
+  useEffect(() => {
+    if (captureSource === 'webcam' && videoRef.current && streamRef.current && !videoRef.current.srcObject) {
+      const video = videoRef.current;
+      video.srcObject = streamRef.current;
+      video.muted = true;
+      video.playsInline = true;
+      video.onloadedmetadata = async () => {
+        try {
+          await video.play();
+          if (video.videoWidth > 0 && video.videoHeight > 0) {
+            setIsCameraReady(true);
+            setIsCameraInitializing(false);
+          }
+        } catch (e) {
+          console.warn('Video mount play error:', e);
+        }
+      };
+    }
+  }, [captureSource, stream]);
+
   const toggleFacingMode = () => {
-    setFacingMode((prev) => (prev === 'environment' ? 'user' : 'environment'));
+    const nextMode = facingMode === 'environment' ? 'user' : 'environment';
+    setFacingMode(nextMode);
+    startCamera(nextMode);
   };
 
   const handleCaptureSnapshot = () => {
-    if (!videoRef.current) return;
+    if (!videoRef.current || isCapturing) return;
     const video = videoRef.current;
-    const canvas = document.createElement('canvas');
-    canvas.width = video.videoWidth || 1280;
-    canvas.height = video.videoHeight || 720;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
 
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
-    stopCamera();
-    setCapturedImage(dataUrl);
-    setReceivedPhotos([{ id: 'webcam_snapshot', name: 'Webcam Capture', url: dataUrl }]);
-    setCurrentStep('preview');
+    if (video.videoWidth <= 0 || video.videoHeight <= 0) {
+      toast.error('Camera Initializing', 'Please wait a moment for the live camera feed to render video frames.');
+      return;
+    }
+
+    setIsCapturing(true);
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('Could not create capture canvas context');
+
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.94);
+
+      if (!dataUrl || dataUrl.length < 200) {
+        throw new Error('Captured image is empty or invalid.');
+      }
+
+      stopCamera();
+      setCapturedImage(dataUrl);
+      setReceivedPhotos([{ id: 'webcam_snapshot', name: 'Webcam Capture', url: dataUrl }]);
+      setCurrentStep('preview');
+    } catch (err: any) {
+      console.error('Capture snapshot error:', err);
+      toast.error('Capture Failed', err.message || 'Could not capture photo from video feed.');
+    } finally {
+      setIsCapturing(false);
+    }
   };
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -645,14 +780,38 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
         {(currentStep === 'capture' || currentStep === 'preview') && (
           <div className="p-6 flex-1 overflow-y-auto space-y-6">
             {/* Enrollment Status Notice */}
-            <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200 flex items-start gap-3 text-xs text-amber-900">
-              <ShieldAlert className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-              <div>
-                <span className="font-semibold">Roster Enrollment Status: </span>
-                {enrolledWithFaces.length} of {enrolledStudents.length} enrolled students have registered face
-                representations. Students without face references can be manually marked in the review tab.
+            {enrolledStudents.length === 0 ? (
+              <div className="p-4 rounded-2xl bg-rose-50 border-2 border-rose-300 flex items-start gap-3.5 text-xs text-rose-950 shadow-sm animate-pulse">
+                <ShieldAlert className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
+                <div className="space-y-1">
+                  <p className="font-bold text-rose-900 text-sm">
+                    Class Roster Empty (0 Enrolled Students)
+                  </p>
+                  <p className="text-rose-800 leading-relaxed">
+                    This lecture belongs to class <strong>{session.class_name || session.class_code || 'selected class'}</strong>, which currently has zero enrolled students. Face recognition matches detected faces against enrolled students; without a roster, no student can be identified.
+                  </p>
+                  <p className="text-[11px] text-rose-700 font-medium pt-0.5">
+                    Please enroll students in this class from the <strong>Classes &amp; Courses &rarr; Class Roster</strong> page or register new students with this class assigned before scanning faces.
+                  </p>
+                </div>
               </div>
-            </div>
+            ) : enrolledWithFaces.length === 0 ? (
+              <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-300 flex items-start gap-3 text-xs text-amber-950">
+                <ShieldAlert className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                <div>
+                  <span className="font-bold text-amber-900">Biometric Enrollment Notice: </span>
+                  0 of {enrolledStudents.length} enrolled students have biometric face representations registered. You can still process photos to detect faces, but matching will require manual instructor confirmation in the review tab.
+                </div>
+              </div>
+            ) : (
+              <div className="p-3.5 rounded-2xl bg-emerald-50 border border-emerald-300 flex items-start gap-3 text-xs text-emerald-950">
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                <div>
+                  <span className="font-bold text-emerald-900">Roster Enrollment Status: </span>
+                  {enrolledWithFaces.length} of {enrolledStudents.length} enrolled students have registered face representations ready for automated matching.
+                </div>
+              </div>
+            )}
 
             {currentStep === 'capture' ? (
               captureSource === 'qr' ? (
@@ -735,10 +894,17 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
                         <button
                           type="button"
                           onClick={processClassroomPhoto}
-                          className="w-full sm:w-auto px-6 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white text-xs font-bold flex items-center justify-center gap-2 shadow-md transition hover:scale-[1.02] cursor-pointer"
+                          disabled={enrolledStudents.length === 0}
+                          className={`w-full sm:w-auto px-6 py-2.5 rounded-xl text-white text-xs font-bold flex items-center justify-center gap-2 shadow-md transition ${
+                            enrolledStudents.length === 0
+                              ? 'bg-slate-400 cursor-not-allowed opacity-60'
+                              : 'bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 hover:scale-[1.02] cursor-pointer'
+                          }`}
                         >
                           <Sparkles className="w-4 h-4" />
-                          {receivedPhotos.length > 1
+                          {enrolledStudents.length === 0
+                            ? 'Cannot Match Faces (Roster Empty)'
+                            : receivedPhotos.length > 1
                             ? `Proceed to Face Recognition (${receivedPhotos.length} Photos)`
                             : 'Proceed to Face Recognition'}
                         </button>
@@ -925,18 +1091,27 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
                       <div className="p-6 text-center space-y-3 max-w-md">
                         <Camera className="w-10 h-10 text-slate-600 mx-auto" />
                         <p className="text-xs text-slate-300 font-medium">{cameraError}</p>
-                        <div className="flex items-center justify-center gap-2">
+                        <div className="flex flex-wrap items-center justify-center gap-2">
                           <button
-                            onClick={() => setCaptureSource('qr')}
+                            type="button"
+                            onClick={() => startCamera()}
                             className="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white text-xs font-semibold rounded-xl transition cursor-pointer"
                           >
-                            Return to Phone QR Code
+                            Retry Camera
                           </button>
                           <button
+                            type="button"
+                            onClick={() => setCaptureSource('qr')}
+                            className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-xl transition cursor-pointer"
+                          >
+                            Phone QR Code
+                          </button>
+                          <button
+                            type="button"
                             onClick={() => fileInputRef.current?.click()}
                             className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-xl transition cursor-pointer"
                           >
-                            Upload File Instead
+                            Upload File
                           </button>
                         </div>
                       </div>
@@ -950,6 +1125,13 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
                           className="w-full h-full object-cover"
                         />
 
+                        {isCameraInitializing && (
+                          <div className="absolute inset-0 bg-slate-950/80 backdrop-blur-sm flex flex-col items-center justify-center space-y-3 z-10">
+                            <Loader2 className="w-8 h-8 text-brand-500 animate-spin" />
+                            <p className="text-xs text-slate-300 font-medium">Initializing camera stream...</p>
+                          </div>
+                        )}
+
                         {/* Viewfinder Target Overlay */}
                         <div className="absolute inset-4 sm:inset-8 border border-white/20 rounded-2xl pointer-events-none flex flex-col justify-between p-4">
                           <div className="flex justify-between items-start">
@@ -958,7 +1140,7 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
                           </div>
                           <div className="text-center">
                             <span className="inline-block px-3 py-1 rounded-full bg-slate-900/70 backdrop-blur-sm text-[11px] text-white border border-white/10 font-medium">
-                              Point webcam at classroom students
+                              {isCameraReady ? 'Point webcam at classroom students' : 'Connecting to camera...'}
                             </span>
                           </div>
                           <div className="flex justify-between items-end">
@@ -972,7 +1154,8 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
                           <button
                             type="button"
                             onClick={toggleFacingMode}
-                            className="p-3 rounded-full bg-slate-900/80 hover:bg-slate-900 text-white backdrop-blur-md border border-white/20 transition cursor-pointer"
+                            disabled={isCameraInitializing}
+                            className="p-3 rounded-full bg-slate-900/80 hover:bg-slate-900 text-white backdrop-blur-md border border-white/20 transition cursor-pointer disabled:opacity-50"
                             title="Switch camera"
                           >
                             <FlipHorizontal className="w-5 h-5" />
@@ -981,10 +1164,24 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
                           <button
                             type="button"
                             onClick={handleCaptureSnapshot}
-                            className="px-6 py-3.5 rounded-full bg-brand-600 hover:bg-brand-500 text-white font-bold text-sm shadow-xl flex items-center gap-2 transition hover:scale-105 active:scale-95 cursor-pointer"
+                            disabled={!isCameraReady || isCapturing}
+                            className={`px-6 py-3.5 rounded-full font-bold text-sm shadow-xl flex items-center gap-2 transition ${
+                              isCameraReady && !isCapturing
+                                ? 'bg-brand-600 hover:bg-brand-500 text-white hover:scale-105 active:scale-95 cursor-pointer'
+                                : 'bg-slate-700 text-slate-400 cursor-not-allowed opacity-70'
+                            }`}
                           >
-                            <Camera className="w-5 h-5" />
-                            Capture Photo
+                            {isCapturing ? (
+                              <>
+                                <Loader2 className="w-5 h-5 animate-spin" />
+                                Capturing...
+                              </>
+                            ) : (
+                              <>
+                                <Camera className="w-5 h-5" />
+                                Capture Photo
+                              </>
+                            )}
                           </button>
 
                           <button
@@ -1028,6 +1225,15 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
                   </div>
                 </div>
 
+                {enrolledStudents.length === 0 && (
+                  <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 text-xs flex items-center gap-2">
+                    <AlertTriangle className="w-4 h-4 shrink-0 text-amber-600" />
+                    <span>
+                      <strong>No students enrolled:</strong> Cannot match classroom faces because 0 students are enrolled in this class. Please enroll students before scanning attendance.
+                    </span>
+                  </div>
+                )}
+
                 <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-2">
                   <button
                     type="button"
@@ -1041,7 +1247,12 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
                   <button
                     type="button"
                     onClick={processClassroomPhoto}
-                    className="w-full sm:w-auto px-6 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-xs font-bold flex items-center justify-center gap-2 shadow-sm transition hover:scale-[1.02] active:scale-[0.98] cursor-pointer"
+                    disabled={enrolledStudents.length === 0}
+                    className={`w-full sm:w-auto px-6 py-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-2 shadow-sm transition ${
+                      enrolledStudents.length === 0
+                        ? 'bg-slate-200 text-slate-400 border border-slate-300 cursor-not-allowed opacity-75'
+                        : 'bg-brand-600 hover:bg-brand-700 text-white hover:scale-[1.02] active:scale-[0.98] cursor-pointer'
+                    }`}
                   >
                     <Sparkles className="w-4 h-4" />
                     Process Faces &amp; Match Roster
@@ -1238,7 +1449,7 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
                                   {student.full_name}
                                 </h5>
                                 <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 font-semibold">
-                                  {match.similarity !== undefined ? (match.similarity * 100).toFixed(0) : '0'}% match
+                                  {match.similarity !== undefined ? Math.round(match.similarity > 1 ? match.similarity : match.similarity * 100) : 0}% match
                                 </span>
                               </div>
                               <p className="text-[11px] text-slate-500 font-mono">{student.roll_number}</p>
@@ -1312,7 +1523,7 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
                                   Suggested: {match.matchedStudent?.full_name || 'Unknown Student'}
                                 </p>
                                 <p className="text-[11px] text-slate-500 font-mono">
-                                  {match.matchedStudent?.roll_number} &bull; {match.similarity !== undefined ? (match.similarity * 100).toFixed(0) : '0'}% resemblance
+                                  {match.matchedStudent?.roll_number} &bull; {match.similarity !== undefined ? Math.round(match.similarity > 1 ? match.similarity : match.similarity * 100) : 0}% resemblance
                                 </p>
                                 {match.sourcePhotoName && (
                                   <span className="inline-flex items-center gap-1 text-[10px] text-amber-800 bg-amber-100/90 px-1.5 py-0.5 rounded border border-amber-200 mt-1">
@@ -1356,7 +1567,7 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
                                   resolvedId === 'unknown'
                                     ? 'bg-slate-800 text-white'
                                     : 'bg-white border border-slate-300 text-slate-700 hover:bg-slate-50'
-                                }`}
+                                  }`}
                               >
                                 Mark as Unknown
                               </button>
@@ -1401,7 +1612,7 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
                             )}
                             <div className="text-[11px]">
                               <p className="font-semibold text-slate-700">Unrecognized</p>
-                              <p className="text-slate-400">Score: {face.similarity !== undefined ? (face.similarity * 100).toFixed(0) : '0'}%</p>
+                              <p className="text-slate-400">Score: {face.similarity !== undefined ? Math.round(face.similarity > 1 ? face.similarity : face.similarity * 100) : 0}%</p>
                               {face.sourcePhotoName && (
                                 <p className="text-[9px] text-slate-400 truncate max-w-[110px]">
                                   {face.sourcePhotoName}

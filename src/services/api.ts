@@ -311,7 +311,15 @@ export class ApiService {
       section: studentData.section.trim(),
       photo_path: photoPath,
       is_active: studentData.is_active ?? true,
+      face_descriptor: studentData.face_descriptor || null,
+      face_enrolled_at: studentData.face_descriptor ? new Date().toISOString() : null,
+      face_enrollment_status:
+        studentData.face_enrollment_status ||
+        (studentData.face_descriptor ? 'enrolled' : 'not_enrolled'),
+      face_quality_score: studentData.face_quality_score || null,
     };
+
+    const targetClassId = (studentData as any).class_id;
 
     if (isSupabaseConfigured()) {
       const { data, error } = await supabase
@@ -331,16 +339,46 @@ export class ApiService {
         throw new Error(`Database error: ${error.message}`);
       }
 
-      return {
+      const createdStudent = {
         ...(data as Student),
         photo_url: photoUrl,
       };
+
+      // Automatically enroll in selected class if specified
+      if (targetClassId) {
+        try {
+          await this.enrollStudentsInClass(targetClassId, [createdStudent.id]);
+
+          // Also populate baseline record if an active attendance session is running
+          const { data: activeSessions } = await supabase
+            .from('attendance_sessions')
+            .select('id')
+            .eq('class_id', targetClassId)
+            .eq('status', 'active');
+
+          if (activeSessions && activeSessions.length > 0) {
+            const newRecords = activeSessions.map((ses) => ({
+              session_id: ses.id,
+              student_id: createdStudent.id,
+              status: 'unmarked',
+              marked_by: instructor.id,
+              method: 'manual',
+            }));
+            await supabase.from('attendance_records').upsert(newRecords, { onConflict: 'session_id,student_id' });
+          }
+        } catch (enrErr) {
+          console.warn('Auto-enrollment on student create warning:', enrErr);
+        }
+      }
+
+      return createdStudent;
     }
 
     const created = LocalDatabase.createStudent({
       ...payload,
       photo_url: photoUrl,
-    });
+      class_id: targetClassId,
+    } as any);
     return created;
   }
 
@@ -529,7 +567,21 @@ export class ApiService {
         .eq('class_id', classId);
 
       if (error || !data) return [];
-      const students = data.map((d: any) => d.students).filter(Boolean) as Student[];
+      let students = data.map((d: any) => d.students).filter(Boolean) as Student[];
+
+      // Fallback: If join returned empty students but enrollment rows exist, query students by ID
+      if (students.length === 0 && data.length > 0) {
+        const studentIds = data.map((d: any) => d.student_id).filter(Boolean);
+        if (studentIds.length > 0) {
+          const { data: directStudents } = await supabase
+            .from('students')
+            .select('*')
+            .in('id', studentIds);
+          if (directStudents) {
+            students = directStudents as Student[];
+          }
+        }
+      }
 
       return Promise.all(
         students.map(async (s) => ({

@@ -7,15 +7,18 @@ import {
   Trash2,
   RefreshCw,
   Camera,
+  Loader2,
 } from 'lucide-react';
-import type { Student } from '../../types';
+import type { Student, ClassCourse, FaceEnrollmentStatus } from '../../types';
 import { validatePhotoFile } from '../../services/storage';
+import { ApiService } from '../../services/api';
+import { FaceRecognitionService } from '../../services/faceRecognition';
 
 interface StudentFormModalProps {
   isOpen: boolean;
   onClose: () => void;
   onSubmit: (
-    data: Omit<Student, 'id' | 'instructor_id' | 'created_at' | 'updated_at'>,
+    data: Omit<Student, 'id' | 'instructor_id' | 'created_at' | 'updated_at'> & { class_id?: string },
     photoFile?: File,
     onProgress?: (pct: number) => void
   ) => Promise<void>;
@@ -37,15 +40,32 @@ export const StudentFormModal: React.FC<StudentFormModalProps> = ({
   const [section, setSection] = useState('Section A');
   const [isActive, setIsActive] = useState(true);
 
-  // Photo management state
+  // Class enrollment assignment
+  const [classes, setClasses] = useState<ClassCourse[]>([]);
+  const [selectedClassId, setSelectedClassId] = useState<string>('');
+
+  // Biometrics & Photo management state
   const [photoFile, setPhotoFile] = useState<File | null>(null);
   const [photoPreview, setPhotoPreview] = useState<string>('');
   const [existingPhotoPath, setExistingPhotoPath] = useState<string>('');
+  const [isExtractingFace, setIsExtractingFace] = useState<boolean>(false);
+  const [faceDescriptor, setFaceDescriptor] = useState<number[] | null>(null);
+  const [faceQualityScore, setFaceQualityScore] = useState<number | null>(null);
+  const [faceStatus, setFaceStatus] = useState<FaceEnrollmentStatus>('not_enrolled');
+  const [faceStatusMessage, setFaceStatusMessage] = useState<string>('');
 
   const [uploadProgress, setUploadProgress] = useState<number>(0);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string>('');
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (isOpen) {
+      ApiService.getClasses()
+        .then((data) => setClasses(data || []))
+        .catch(() => setClasses([]));
+    }
+  }, [isOpen]);
 
   useEffect(() => {
     if (studentToEdit) {
@@ -59,7 +79,12 @@ export const StudentFormModal: React.FC<StudentFormModalProps> = ({
       setIsActive(studentToEdit.is_active);
       setExistingPhotoPath(studentToEdit.photo_path);
       setPhotoPreview(studentToEdit.photo_url || '');
+      setFaceDescriptor(studentToEdit.face_descriptor || null);
+      setFaceQualityScore(studentToEdit.face_quality_score || null);
+      setFaceStatus(studentToEdit.face_enrollment_status || (studentToEdit.face_descriptor ? 'enrolled' : 'not_enrolled'));
+      setFaceStatusMessage(studentToEdit.face_descriptor ? 'Face biometrics enrolled' : '');
       setPhotoFile(null);
+      setSelectedClassId('');
     } else {
       // Defaults for new student
       setFullName('');
@@ -72,7 +97,12 @@ export const StudentFormModal: React.FC<StudentFormModalProps> = ({
       setIsActive(true);
       setExistingPhotoPath('');
       setPhotoPreview('');
+      setFaceDescriptor(null);
+      setFaceQualityScore(null);
+      setFaceStatus('not_enrolled');
+      setFaceStatusMessage('');
       setPhotoFile(null);
+      setSelectedClassId('');
     }
     setErrorMessage('');
     setUploadProgress(0);
@@ -92,13 +122,55 @@ export const StudentFormModal: React.FC<StudentFormModalProps> = ({
 
     setErrorMessage('');
     setPhotoFile(file);
-    setPhotoPreview(URL.createObjectURL(file));
+    const objectUrl = URL.createObjectURL(file);
+    setPhotoPreview(objectUrl);
+
+    // Asynchronously validate face biometrics and extract 128-d descriptor
+    setIsExtractingFace(true);
+    setFaceStatusMessage('Analyzing face biometrics...');
+
+    const img = new Image();
+    img.src = objectUrl;
+    img.onload = async () => {
+      try {
+        await FaceRecognitionService.loadModels();
+        const res = await FaceRecognitionService.validateAndExtractReferenceDescriptor(img);
+        if (res.valid && res.descriptor) {
+          setFaceDescriptor(res.descriptor);
+          setFaceQualityScore(res.qualityScore || 0.95);
+          setFaceStatus('enrolled');
+          setFaceStatusMessage(`Face biometrics verified (${Math.round((res.qualityScore || 0.95) * 100)}% quality)`);
+        } else {
+          setFaceDescriptor(null);
+          setFaceQualityScore(null);
+          setFaceStatus('failed');
+          setFaceStatusMessage(res.error || 'No single clear face detected in photo.');
+        }
+      } catch (err: any) {
+        console.warn('Face biometric extraction warning:', err);
+        setFaceDescriptor(null);
+        setFaceQualityScore(null);
+        setFaceStatus('pending');
+        setFaceStatusMessage('Biometric extraction pending model initialization');
+      } finally {
+        setIsExtractingFace(false);
+      }
+    };
+    img.onerror = () => {
+      setIsExtractingFace(false);
+      setFaceStatus('not_enrolled');
+      setFaceStatusMessage('Could not load image for face detection');
+    };
   };
 
   const handleRemovePhoto = () => {
     setPhotoFile(null);
     setPhotoPreview('');
     setExistingPhotoPath('');
+    setFaceDescriptor(null);
+    setFaceQualityScore(null);
+    setFaceStatus('not_enrolled');
+    setFaceStatusMessage('');
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
@@ -136,6 +208,10 @@ export const StudentFormModal: React.FC<StudentFormModalProps> = ({
           photo_path: existingPhotoPath || '',
           photo_url: photoPreview,
           is_active: isActive,
+          face_descriptor: faceDescriptor,
+          face_enrollment_status: faceStatus,
+          face_quality_score: faceQualityScore,
+          class_id: selectedClassId || undefined,
         },
         photoFile || undefined,
         (pct) => setUploadProgress(pct)
@@ -255,6 +331,28 @@ export const StudentFormModal: React.FC<StudentFormModalProps> = ({
                   Images are stored in private access-controlled storage for facial verification.
                 </p>
 
+                {/* Face Biometric Status Badge */}
+                {photoPreview && (
+                  <div className="pt-1 flex items-center justify-center sm:justify-start">
+                    {isExtractingFace ? (
+                      <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-xl bg-indigo-50 border border-indigo-200 text-indigo-700 text-xs font-medium animate-pulse">
+                        <Loader2 className="w-3.5 h-3.5 animate-spin text-indigo-600" />
+                        <span>Analyzing facial biometrics...</span>
+                      </div>
+                    ) : faceStatus === 'enrolled' ? (
+                      <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-xl bg-emerald-50 border border-emerald-300 text-emerald-800 text-xs font-semibold">
+                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                        <span>{faceStatusMessage || 'Face Biometrics Enrolled (128-d Embedding Ready)'}</span>
+                      </div>
+                    ) : faceStatus === 'failed' ? (
+                      <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-xl bg-amber-50 border border-amber-300 text-amber-800 text-xs font-medium">
+                        <AlertCircle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                        <span>{faceStatusMessage || 'Could not detect a clear single face in this photo.'}</span>
+                      </div>
+                    ) : null}
+                  </div>
+                )}
+
                 {/* Upload Progress Bar */}
                 {isSubmitting && uploadProgress > 0 && (
                   <div className="w-full bg-slate-200 rounded-full h-2 mt-2 overflow-hidden">
@@ -304,8 +402,30 @@ export const StudentFormModal: React.FC<StudentFormModalProps> = ({
             </div>
           </div>
 
-          {/* Section 3: Academic Details */}
+          {/* Section 3: Academic Details & Class Assignment */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="sm:col-span-2">
+              <label className="block text-xs font-semibold text-slate-700 mb-1.5">
+                Assign to Class / Course <span className="text-slate-400 font-normal">(Auto-enroll for attendance)</span>
+              </label>
+              <select
+                value={selectedClassId}
+                onChange={(e) => setSelectedClassId(e.target.value)}
+                disabled={isSubmitting}
+                className="w-full px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500 transition"
+              >
+                <option value="">-- None (Directory Only / Enroll Later) --</option>
+                {classes.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name} ({c.code} - Sec {c.section})
+                  </option>
+                ))}
+              </select>
+              <span className="text-[10px] text-slate-400 mt-1 block">
+                Enrolling the student links them directly to the active class roster and attendance sessions.
+              </span>
+            </div>
+
             <div>
               <label className="block text-xs font-semibold text-slate-700 mb-1.5">
                 Course / Programme <span className="text-rose-500">*</span>

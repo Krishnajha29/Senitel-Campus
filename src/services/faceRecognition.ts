@@ -225,10 +225,36 @@ export class FaceRecognitionService {
       await this.loadModels();
     }
 
+    const origWidth =
+      'naturalWidth' in sourceImageOrCanvas
+        ? sourceImageOrCanvas.naturalWidth || sourceImageOrCanvas.width
+        : sourceImageOrCanvas.width;
+    const origHeight =
+      'naturalHeight' in sourceImageOrCanvas
+        ? sourceImageOrCanvas.naturalHeight || sourceImageOrCanvas.height
+        : sourceImageOrCanvas.height;
+
+    // Scale down image if larger than 1600px to optimize inference performance without losing face detail
+    let targetElement: HTMLImageElement | HTMLCanvasElement = sourceImageOrCanvas;
+    let scale = 1.0;
+    const MAX_DIM = 1600;
+
+    if (origWidth > MAX_DIM || origHeight > MAX_DIM) {
+      scale = MAX_DIM / Math.max(origWidth, origHeight);
+      const scaledCanvas = document.createElement('canvas');
+      scaledCanvas.width = Math.round(origWidth * scale);
+      scaledCanvas.height = Math.round(origHeight * scale);
+      const ctx = scaledCanvas.getContext('2d');
+      if (ctx) {
+        ctx.drawImage(sourceImageOrCanvas, 0, 0, scaledCanvas.width, scaledCanvas.height);
+        targetElement = scaledCanvas;
+      }
+    }
+
     // Use SSD MobileNet v1 for high accuracy multi-face detection
     const detections = await faceapi
       .detectAllFaces(
-        sourceImageOrCanvas,
+        targetElement,
         new faceapi.SsdMobilenetv1Options({
           minConfidence: FACE_THRESHOLDS.MIN_DETECTION_CONFIDENCE,
         })
@@ -237,11 +263,12 @@ export class FaceRecognitionService {
       .withFaceDescriptors();
 
     return detections.map((d, index) => {
+      // Re-scale bounding box coordinates back to original source dimensions if scaled
       const box: FaceBoundingBox = {
-        x: Math.round(d.detection.box.x),
-        y: Math.round(d.detection.box.y),
-        width: Math.round(d.detection.box.width),
-        height: Math.round(d.detection.box.height),
+        x: Math.round(d.detection.box.x / scale),
+        y: Math.round(d.detection.box.y / scale),
+        width: Math.round(d.detection.box.width / scale),
+        height: Math.round(d.detection.box.height / scale),
       };
 
       const cropUrl = this.extractFaceCrop(sourceImageOrCanvas, box);
@@ -448,14 +475,29 @@ export class FaceRecognitionService {
   }
 
   /**
-   * Helper to load an image URL into an HTMLImageElement
+   * Helper to load an image URL into an HTMLImageElement with timeout safety
    */
-  static loadImageElement(url: string): Promise<HTMLImageElement> {
+  static loadImageElement(url: string, timeoutMs = 15000): Promise<HTMLImageElement> {
     return new Promise((resolve, reject) => {
       const img = new Image();
       img.crossOrigin = 'anonymous';
-      img.onload = () => resolve(img);
-      img.onerror = () => reject(new Error(`Failed to load image from ${url.slice(0, 50)}...`));
+
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        reject(new Error(`Timed out loading image after ${timeoutMs}ms.`));
+      }, timeoutMs);
+
+      img.onload = () => {
+        if (timedOut) return;
+        clearTimeout(timer);
+        resolve(img);
+      };
+      img.onerror = () => {
+        if (timedOut) return;
+        clearTimeout(timer);
+        reject(new Error(`Failed to load image from ${url.slice(0, 50)}...`));
+      };
       img.src = url;
     });
   }
