@@ -737,4 +737,66 @@ export class FaceRecognitionService {
       perPhotoResults,
     };
   }
+
+  /**
+   * Server-Side Inference: Validates student reference photo using the FastAPI cv_service.
+   * Uses relative /api/cv paths in production on Vercel without hardcoded localhost.
+   */
+  static async validateReferencePhotoViaBackend(
+    file: File | Blob,
+    backendBaseUrl = ''
+  ): Promise<{ valid: boolean; descriptor: number[]; quality_score: number; box?: FaceBoundingBox; message?: string }> {
+    const formData = new FormData();
+    formData.append('file', file);
+    const baseUrl = backendBaseUrl || (typeof window !== 'undefined' ? '' : '');
+    const res = await fetch(`${baseUrl}/api/cv/validate-reference-photo`, {
+      method: 'POST',
+      body: formData,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err.detail || `Validation failed with status ${res.status}`);
+    }
+    return res.json();
+  }
+
+  /**
+   * Server-Side Inference: Submits classroom photo to the FastAPI cv_service for multi-face detection.
+   */
+  static async processClassroomPhotoViaBackend(
+    file: File | Blob,
+    roster: Student[],
+    backendBaseUrl = ''
+  ): Promise<{
+    total_faces: number;
+    high_confidence_matches: any[];
+    needs_review_matches: any[];
+    unknown_faces: any[];
+    not_detected_student_ids: string[];
+  }> {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append(
+      'roster_json',
+      JSON.stringify(
+        roster.map((s) => ({
+          id: s.id,
+          full_name: s.full_name,
+          roll_number: s.roll_number,
+          descriptor: s.face_descriptor || [],
+        }))
+      )
+    );
+    const baseUrl = backendBaseUrl || (typeof window !== 'undefined' ? '' : '');
+    const res = await fetch(`${baseUrl}/api/cv/process-classroom-photo`, {
+      method: 'POST',
+      body: formData,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err.detail || `Processing failed with status ${res.status}`);
+    }
+    return res.json();
+  }
 }
+

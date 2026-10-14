@@ -24,16 +24,20 @@ app = FastAPI(
     version="1.0.0",
 )
 
+import os
+origins_env = os.getenv("ALLOWED_ORIGINS", "*")
+origins = [o.strip() for o in origins_env.split(",") if o.strip()] if origins_env != "*" else ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 class EnrolledStudentDescriptor(BaseModel):
-    id: string = ""
+    id: str = ""
     full_name: str
     roll_number: str
     descriptor: List[float]
@@ -68,15 +72,21 @@ def euclidean_distance(v1: np.ndarray, v2: np.ndarray) -> float:
 def distance_to_similarity(distance: float) -> int:
     return max(0, min(100, round((1.0 - distance / 1.0) * 100)))
 
+@app.get("/")
 @app.get("/health")
+@app.get("/api/cv/health")
 def health_check():
     return {
         "status": "healthy",
         "engine": "dlib/face_recognition" if CV_AVAILABLE else "synthetic_mock_mode",
         "service": "Sentinel Campus CV Microservice",
+        "version": "1.0.0",
     }
 
 @app.post("/api/cv/validate-reference-photo")
+@app.post("/validate-reference-photo")
+@app.post("/api/cv/extract-descriptor")
+@app.post("/extract-descriptor")
 async def validate_reference_photo(file: UploadFile = File(...)):
     """
     Validates a student reference photo for registration:
@@ -120,6 +130,7 @@ async def validate_reference_photo(file: UploadFile = File(...)):
     }
 
 @app.post("/api/cv/process-classroom-photo", response_model=ClassroomPhotoResponse)
+@app.post("/process-classroom-photo", response_model=ClassroomPhotoResponse)
 async def process_classroom_photo(
     file: UploadFile = File(...),
     roster_json: str = Form(...),

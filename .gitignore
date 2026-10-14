@@ -28,3 +28,13 @@ dist-ssr
 desktop.ini
 Thumbs.db
 supabase/.temp/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
