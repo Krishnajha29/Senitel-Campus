@@ -32,6 +32,8 @@ import type {
   PhotoUploadSession,
   ClassCourse,
   AcademicSection,
+  SharedMobileQRSession,
+  SharedMobileQRSessionStatus,
 } from '../../types';
 import { FaceRecognitionService } from '../../services/faceRecognition';
 import { ApiService } from '../../services/api';
@@ -49,6 +51,7 @@ interface FaceAttendanceModalProps {
 type Step = 'capture' | 'preview' | 'processing' | 'review' | 'confirming';
 type ReviewTab = 'high_confidence' | 'needs_review' | 'not_detected' | 'face_required' | 'unknown_faces';
 type CaptureSource = 'qr' | 'webcam';
+type QrMode = 'mobile_app' | 'photo_upload';
 
 export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
   isOpen,
@@ -63,8 +66,17 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
   const [currentStep, setCurrentStep] = useState<Step>('capture');
   const [activeTab, setActiveTab] = useState<ReviewTab>('high_confidence');
   const [captureSource, setCaptureSource] = useState<CaptureSource>('qr');
+  const [qrMode, setQrMode] = useState<QrMode>('mobile_app');
 
-  // QR Session state
+  // Shared Mobile App QR Session state (Student-by-student live scan)
+  const [sharedMobileSession, setSharedMobileSession] = useState<SharedMobileQRSession | null>(null);
+  const [sharedMobileQrDataUrl, setSharedMobileQrDataUrl] = useState<string | null>(null);
+  const [sharedMobileStatus, setSharedMobileStatus] = useState<SharedMobileQRSessionStatus | null>(null);
+  const [isGeneratingSharedMobileQr, setIsGeneratingSharedMobileQr] = useState<boolean>(false);
+  const [copiedToken, setCopiedToken] = useState<boolean>(false);
+  const [isFinalizingMobileSession, setIsFinalizingMobileSession] = useState<boolean>(false);
+
+  // Photo Upload Session state (Multi-photo upload)
   const [uploadSession, setUploadSession] = useState<PhotoUploadSession | null>(null);
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
   const [uploadUrl, setUploadUrl] = useState<string | null>(null);
@@ -324,17 +336,85 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
     }
   }, [session?.id]);
 
+  // Shared Mobile Session Initialization
+  const initOrFetchSharedMobileSession = useCallback(async () => {
+    if (!session?.id) return;
+    setIsGeneratingSharedMobileQr(true);
+    try {
+      const res = await ApiService.createSharedMobileQRSession(session.id, 'checkpoint_1', 10);
+      setSharedMobileSession(res.session);
+      setSharedMobileQrDataUrl(res.qrDataUrl);
+    } catch (err: any) {
+      console.warn('[FaceAttendanceModal] Error creating shared mobile session:', err);
+    } finally {
+      setIsGeneratingSharedMobileQr(false);
+    }
+  }, [session?.id]);
+
+  const handleCopyToken = () => {
+    if (!sharedMobileSession?.token) return;
+    navigator.clipboard.writeText(sharedMobileSession.token);
+    setCopiedToken(true);
+    toast.success('Token Copied', `Session token ${sharedMobileSession.token} copied to clipboard.`);
+    setTimeout(() => setCopiedToken(false), 2500);
+  };
+
+  const handleFinalizeMobileSession = async () => {
+    if (!sharedMobileSession?.token || !session?.id) return;
+    setIsFinalizingMobileSession(true);
+    try {
+      await ApiService.closeSharedMobileQRSession(sharedMobileSession.token);
+      await ApiService.refreshSessionRoster(session.id);
+      const confirmedCount = sharedMobileStatus?.stats.identifiedCount || 0;
+      toast.success(
+        'Attendance Session Finalized',
+        `${confirmedCount} student(s) marked present via mobile biometric capture.`
+      );
+      if (onAttendanceSubmitted) {
+        onAttendanceSubmitted();
+      }
+      onClose();
+    } catch (err: any) {
+      toast.error('Finalization Error', err.message || 'Could not close mobile session.');
+    } finally {
+      setIsFinalizingMobileSession(false);
+    }
+  };
+
   // Load session when modal opens
   useEffect(() => {
     if (isOpen) {
       setCurrentStep('capture');
       setCaptureSource('qr');
+      setQrMode('mobile_app');
       setCapturedImage(null);
       setReceivedPhotos([]);
       setScanSummary(null);
+      initOrFetchSharedMobileSession();
       initOrFetchQrSession();
     }
-  }, [isOpen, initOrFetchQrSession]);
+  }, [isOpen, initOrFetchSharedMobileSession, initOrFetchQrSession]);
+
+  // Real-time Background Polling for Shared Mobile Session Captures
+  useEffect(() => {
+    if (!isOpen || !sharedMobileSession?.token || currentStep !== 'capture') return;
+    if (captureSource !== 'qr' || qrMode !== 'mobile_app') return;
+
+    const pollStatus = async () => {
+      try {
+        const status = await ApiService.getSharedMobileQRSessionStatus(sharedMobileSession.token);
+        if (status) {
+          setSharedMobileStatus(status);
+        }
+      } catch (err) {
+        console.warn('Error polling shared mobile status:', err);
+      }
+    };
+
+    pollStatus();
+    const interval = setInterval(pollStatus, 2000);
+    return () => clearInterval(interval);
+  }, [isOpen, sharedMobileSession?.token, currentStep, captureSource, qrMode]);
 
   // Expiration countdown timer
   useEffect(() => {
@@ -1131,10 +1211,252 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
               captureSource === 'qr' ? (
                 /* QR-First Interface */
                 <div className="space-y-6">
-                  {/* Photo Received Card vs QR Waiting Card */}
-                  {(uploadSession?.status === 'photo_received' && (receivedPhotos.length > 0 || capturedImage)) ? (
-                    /* Photo(s) Received State */
-                    <div className="bg-slate-50 border-2 border-emerald-500/30 rounded-3xl p-6 text-center space-y-5 shadow-sm">
+                  {/* QR Method Selector: Sentinel Campus Mobile App Live Scan vs Batch Photo Upload */}
+                  <div className="flex flex-col sm:flex-row items-center gap-2 p-1.5 bg-slate-100 rounded-2xl border border-slate-200">
+                    <button
+                      type="button"
+                      onClick={() => setQrMode('mobile_app')}
+                      className={`w-full sm:flex-1 py-2 px-3 rounded-xl text-xs font-bold flex items-center justify-center gap-2 transition cursor-pointer ${
+                        qrMode === 'mobile_app'
+                          ? 'bg-white text-slate-900 shadow-sm'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      <Smartphone className="w-4 h-4 text-brand-600" />
+                      <span>Live Mobile App Capture (Student-by-Student)</span>
+                      <span className="px-1.5 py-0.5 rounded bg-brand-50 text-brand-700 text-[10px] font-semibold border border-brand-200">
+                        Integrated
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setQrMode('photo_upload')}
+                      className={`w-full sm:flex-1 py-2 px-3 rounded-xl text-xs font-bold flex items-center justify-center gap-2 transition cursor-pointer ${
+                        qrMode === 'photo_upload'
+                          ? 'bg-white text-slate-900 shadow-sm'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      <ImageIcon className="w-4 h-4 text-slate-600" />
+                      <span>Classroom Photo Upload (Multi-Photo Batch)</span>
+                    </button>
+                  </div>
+
+                  {qrMode === 'mobile_app' ? (
+                    /* Live Student-by-Student Mobile Capture Interface */
+                    <div className="space-y-6">
+                      <div className="grid grid-cols-1 md:grid-cols-12 gap-6 items-start">
+                        {/* Left: Prominent QR Code for ClassQRScannerModal */}
+                        <div className="md:col-span-5 flex flex-col items-center justify-center p-6 bg-slate-900 rounded-3xl text-white shadow-md border border-slate-800">
+                          <div className="mb-3 text-center">
+                            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-brand-500/20 text-brand-300 border border-brand-500/30 text-xs font-medium">
+                              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+                              Live Classroom Capture QR
+                            </span>
+                          </div>
+
+                          {/* QR Code Container */}
+                          <div className="bg-white p-4 rounded-2xl shadow-inner border border-slate-200">
+                            {isGeneratingSharedMobileQr ? (
+                              <div className="w-52 h-52 flex flex-col items-center justify-center text-slate-400">
+                                <Loader2 className="w-8 h-8 animate-spin text-brand-600 mb-2" />
+                                <span className="text-xs">Generating Session QR...</span>
+                              </div>
+                            ) : sharedMobileQrDataUrl ? (
+                              <img
+                                src={sharedMobileQrDataUrl}
+                                alt="Scan with Sentinel Campus Mobile App"
+                                className="w-52 h-52 object-contain rounded-lg"
+                              />
+                            ) : (
+                              <div className="w-52 h-52 flex items-center justify-center text-slate-400 text-xs">
+                                No QR Available
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Token Pill with Copy */}
+                          <div className="mt-4 w-full p-2.5 rounded-xl bg-slate-800/80 border border-slate-700/80 flex items-center justify-between">
+                            <div className="flex items-center gap-2">
+                              <QrCode className="w-4 h-4 text-brand-400" />
+                              <span className="text-[11px] text-slate-400 font-medium">Token:</span>
+                              <code className="text-xs font-mono font-bold text-white tracking-widest">
+                                {sharedMobileSession?.token || '........'}
+                              </code>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={handleCopyToken}
+                              className="px-2.5 py-1 rounded-lg bg-slate-700 hover:bg-slate-600 text-[11px] font-bold text-slate-200 transition cursor-pointer flex items-center gap-1"
+                            >
+                              {copiedToken ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                              {copiedToken ? 'Copied' : 'Copy'}
+                            </button>
+                          </div>
+
+                          {/* Expiration countdown & Regenerate */}
+                          <div className="mt-3 flex items-center justify-between w-full text-xs text-slate-400 px-1">
+                            <span className="flex items-center gap-1 text-[11px]">
+                              <Clock className="w-3.5 h-3.5 text-brand-400" />
+                              10-min window
+                            </span>
+                            <button
+                              type="button"
+                              onClick={initOrFetchSharedMobileSession}
+                              disabled={isGeneratingSharedMobileQr}
+                              className="text-[11px] font-semibold text-brand-400 hover:text-brand-300 flex items-center gap-1 cursor-pointer"
+                            >
+                              <RefreshCw className={`w-3 h-3 ${isGeneratingSharedMobileQr ? 'animate-spin' : ''}`} />
+                              Regenerate
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Right: Real-time Stats & Capture Stream */}
+                        <div className="md:col-span-7 space-y-4">
+                          {/* Header & Instructions */}
+                          <div className="space-y-1">
+                            <h4 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                              <Smartphone className="w-5 h-5 text-brand-600" />
+                              Live Mobile Attendance Stream
+                            </h4>
+                            <p className="text-xs text-slate-600 leading-relaxed">
+                              Open the <strong>Sentinel Campus</strong> mobile app, tap <strong>Scan Class Session QR</strong>, and scan students one-by-one at the doorway or podium.
+                            </p>
+                          </div>
+
+                          {/* Live Counter Badges Grid */}
+                          <div className="grid grid-cols-4 gap-2.5">
+                            <div className="p-3 rounded-2xl bg-slate-50 border border-slate-200 text-center">
+                              <span className="text-[11px] font-medium text-slate-500 block">Roster</span>
+                              <span className="text-lg font-black text-slate-900">
+                                {sharedMobileStatus?.stats.totalStudents ?? effectiveRoster.length}
+                              </span>
+                            </div>
+
+                            <div className="p-3 rounded-2xl bg-emerald-50 border border-emerald-200 text-center">
+                              <span className="text-[11px] font-medium text-emerald-700 block">Present</span>
+                              <span className="text-lg font-black text-emerald-700">
+                                {sharedMobileStatus?.stats.identifiedCount ?? 0}
+                              </span>
+                            </div>
+
+                            <div className="p-3 rounded-2xl bg-amber-50 border border-amber-200 text-center">
+                              <span className="text-[11px] font-medium text-amber-700 block">Review</span>
+                              <span className="text-lg font-black text-amber-700">
+                                {sharedMobileStatus?.stats.pendingCount ?? 0}
+                              </span>
+                            </div>
+
+                            <div className="p-3 rounded-2xl bg-rose-50 border border-rose-200 text-center">
+                              <span className="text-[11px] font-medium text-rose-700 block">Unmatched</span>
+                              <span className="text-lg font-black text-rose-700">
+                                {sharedMobileStatus?.stats.rejectedCount ?? 0}
+                              </span>
+                            </div>
+                          </div>
+
+                          {/* Real-Time Captures Feed */}
+                          <div className="p-4 rounded-2xl bg-slate-900 text-white border border-slate-800 space-y-3">
+                            <div className="flex items-center justify-between pb-2 border-b border-slate-800">
+                              <span className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
+                                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                                Live Captures Feed
+                              </span>
+                              <span className="text-[11px] text-slate-400">
+                                {sharedMobileStatus?.recentCaptures.length || 0} event(s) recorded
+                              </span>
+                            </div>
+
+                            {sharedMobileStatus?.recentCaptures && sharedMobileStatus.recentCaptures.length > 0 ? (
+                              <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                                {sharedMobileStatus.recentCaptures.map((capture, idx) => (
+                                  <div
+                                    key={capture.id || idx}
+                                    className="flex items-center justify-between p-2.5 rounded-xl bg-slate-800/80 border border-slate-700/60"
+                                  >
+                                    <div className="flex items-center gap-2.5">
+                                      {capture.thumbnailUrl ? (
+                                        <img
+                                          src={capture.thumbnailUrl}
+                                          alt="Captured frame"
+                                          className="w-8 h-8 rounded-lg object-cover border border-slate-600"
+                                        />
+                                      ) : (
+                                        <div className="w-8 h-8 rounded-lg bg-slate-700 flex items-center justify-center text-xs font-bold text-slate-300">
+                                          {capture.studentName.charAt(0)}
+                                        </div>
+                                      )}
+                                      <div>
+                                        <p className="text-xs font-bold text-white leading-tight">{capture.studentName}</p>
+                                        <p className="text-[10px] text-slate-400 font-mono">{capture.identifierCode}</p>
+                                      </div>
+                                    </div>
+
+                                    <div className="text-right">
+                                      {capture.status === 'confirmed' ? (
+                                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 text-[10px] font-bold border border-emerald-500/30">
+                                          <CheckCircle2 className="w-3 h-3" />
+                                          Verified
+                                        </span>
+                                      ) : capture.status === 'duplicate' ? (
+                                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-300 text-[10px] font-bold border border-blue-500/30">
+                                          Already Present
+                                        </span>
+                                      ) : capture.status === 'ambiguous' ? (
+                                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 text-[10px] font-bold border border-amber-500/30">
+                                          <AlertTriangle className="w-3 h-3" />
+                                          Ambiguous
+                                        </span>
+                                      ) : (
+                                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-rose-500/20 text-rose-300 text-[10px] font-bold border border-rose-500/30">
+                                          <UserX className="w-3 h-3" />
+                                          Unrecognized
+                                        </span>
+                                      )}
+                                      <span className="text-[9px] text-slate-400 block mt-0.5">
+                                        {new Date(capture.capturedAt).toLocaleTimeString()}
+                                      </span>
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : (
+                              <div className="py-8 text-center text-slate-400 space-y-1">
+                                <Camera className="w-6 h-6 mx-auto text-slate-500 mb-1" />
+                                <p className="text-xs font-medium text-slate-300">Ready for Live Student Captures</p>
+                                <p className="text-[11px] text-slate-500 max-w-sm mx-auto">
+                                  Once the teacher or TA scans the QR code with the mobile app and captures students, real-time verification events will stream here automatically.
+                                </p>
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Action Controls */}
+                          <div className="flex items-center justify-end gap-3 pt-2">
+                            <button
+                              type="button"
+                              onClick={handleFinalizeMobileSession}
+                              disabled={isFinalizingMobileSession}
+                              className="px-5 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-xs font-bold flex items-center gap-2 shadow-md transition cursor-pointer disabled:opacity-50"
+                            >
+                              {isFinalizingMobileSession ? (
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                              ) : (
+                                <CheckCircle2 className="w-4 h-4" />
+                              )}
+                              Complete & Sync Attendance
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    /* Photo Received Card vs QR Waiting Card (Multi-Photo Upload) */
+                    (uploadSession?.status === 'photo_received' && (receivedPhotos.length > 0 || capturedImage)) ? (
+                      /* Photo(s) Received State */
+                      <div className="bg-slate-50 border-2 border-emerald-500/30 rounded-3xl p-6 text-center space-y-5 shadow-sm">
                       <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 text-emerald-700 border border-emerald-500/30 text-xs font-semibold">
                         <CheckCircle className="w-4 h-4 text-emerald-600" />
                         {receivedPhotos.length > 1
@@ -1370,7 +1692,7 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
                         </div>
                       </div>
                     </div>
-                  )}
+                  ))}
 
                   {/* Fallback Section: Upload from computer or try webcam */}
                   <div className="p-4 rounded-2xl border border-slate-200 bg-slate-50/50 flex flex-col sm:flex-row items-center justify-between gap-3">

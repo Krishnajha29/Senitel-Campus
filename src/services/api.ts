@@ -28,6 +28,8 @@ import type {
   SubmitClassroomPhotoResult,
   SubmitClassroomPhotoBatchResult,
   UploadedPhotoItem,
+  SharedMobileQRSession,
+  SharedMobileQRSessionStatus,
 } from '../types';
 import {
   generateCryptographicKey,
@@ -2142,6 +2144,191 @@ export class ApiService {
 
   static async deleteUploadedPhoto(photoId: string): Promise<boolean> {
     return LocalDatabase.deleteUploadedPhoto(photoId);
+  }
+
+  // -------------------------------------------------------------
+  // Shared Mobile QR Session & Student-by-Student Live Capture
+  // -------------------------------------------------------------
+  static getMobileApiBaseUrl(): string {
+    const configured = (import.meta.env.VITE_MOBILE_API_BASE_URL || '').trim();
+    if (configured) return configured.replace(/\/$/, '');
+    return 'https://elk-refund-fifty.ngrok-free.dev';
+  }
+
+  static async createSharedMobileQRSession(
+    sessionId: string,
+    checkpointType: 'checkpoint_1' | 'checkpoint_2' = 'checkpoint_1',
+    durationMinutes = 10
+  ): Promise<{
+    session: SharedMobileQRSession;
+    qrPayload: string;
+    qrDataUrl: string;
+    token: string;
+  }> {
+    const instructor = await this.getCurrentInstructor();
+    if (!instructor) throw new Error('Authentication required.');
+
+    const sessionObj = await this.getSessionById(sessionId);
+    if (!sessionObj) throw new Error('Attendance session not found.');
+
+    const classObj = await this.getClassById(sessionObj.class_id);
+    const eligibleStudents = await this.getClassEnrollments(sessionObj.class_id);
+
+    // Retrieve active JWT access token from Supabase Auth
+    let accessToken = '';
+    if (isSupabaseConfigured()) {
+      const { data } = await supabase.auth.getSession();
+      accessToken = data.session?.access_token || '';
+    }
+    if (!accessToken) {
+      accessToken = `mock_inst_${instructor.id}`;
+    }
+
+    // Format student face representations for Euclidean matching on mobile backend
+    const studentsPayload = eligibleStudents.map((s) => ({
+      id: s.id,
+      full_name: s.full_name,
+      roll_number: s.roll_number,
+      face_descriptor: s.face_descriptor || null,
+      photo_url: s.photo_url || null,
+      section: s.section || null,
+      department: s.course || null,
+    }));
+
+    const baseUrl = this.getMobileApiBaseUrl();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/classes/dashboard-session`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${accessToken}`,
+          'ngrok-skip-browser-warning': 'true',
+        },
+        signal: AbortSignal.timeout(2500),
+        body: JSON.stringify({
+          sessionId: sessionObj.id,
+          classId: sessionObj.class_id,
+          checkpointType,
+          courseCode: classObj?.code || sessionObj.class_code || 'CLASS',
+          courseName: classObj?.name || sessionObj.class_name || 'Class Lecture',
+          students: studentsPayload,
+          durationMinutes,
+        }),
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        if (data.success && data.session) {
+          const qrPayload = data.qrPayload || JSON.stringify({
+            app: 'SentinelCampus',
+            token: data.session.token,
+            classId: data.session.classId,
+            sessionId: data.session.sessionId,
+            courseCode: data.session.courseCode,
+            checkpointType: data.session.checkpointType,
+            expiresAt: data.session.expiresAt,
+          });
+
+          const qrDataUrl = await QRCode.toDataURL(qrPayload, {
+            errorCorrectionLevel: 'M',
+            margin: 2,
+            width: 320,
+          });
+
+          return {
+            session: data.session,
+            qrPayload,
+            qrDataUrl,
+            token: data.session.token,
+          };
+        }
+      }
+    } catch (err) {
+      console.warn('[ApiService] Remote mobile backend call error, falling back:', err);
+    }
+
+    // Fallback: Generate valid local crypto session token and payload compatible with ClassQRScannerModal
+    const plainToken = generateSalt().slice(0, 8).toUpperCase();
+    const expiresAt = new Date(Date.now() + durationMinutes * 60 * 1000).toISOString();
+    const fallbackPayload = JSON.stringify({
+      app: 'SentinelCampus',
+      token: plainToken,
+      classId: sessionObj.class_id,
+      sessionId: sessionObj.id,
+      courseCode: classObj?.code || sessionObj.class_code || 'CLASS',
+      checkpointType,
+      expiresAt,
+    });
+
+    const qrDataUrl = await QRCode.toDataURL(fallbackPayload, {
+      errorCorrectionLevel: 'M',
+      margin: 2,
+      width: 320,
+    });
+
+    const fallbackSession: SharedMobileQRSession = {
+      id: `dash_qr_${plainToken}`,
+      token: plainToken,
+      classId: sessionObj.class_id,
+      sessionId: sessionObj.id,
+      courseCode: classObj?.code || sessionObj.class_code || 'CLASS',
+      courseName: classObj?.name || sessionObj.class_name || 'Class Lecture',
+      teacherId: instructor.id,
+      checkpointType,
+      createdAt: new Date().toISOString(),
+      expiresAt,
+      isActive: true,
+      remainingSeconds: durationMinutes * 60,
+      qrPayload: fallbackPayload,
+    };
+
+    return {
+      session: fallbackSession,
+      qrPayload: fallbackPayload,
+      qrDataUrl,
+      token: plainToken,
+    };
+  }
+
+  static async getSharedMobileQRSessionStatus(
+    token: string
+  ): Promise<SharedMobileQRSessionStatus | null> {
+    const baseUrl = this.getMobileApiBaseUrl();
+    try {
+      const response = await fetch(`${baseUrl}/api/classes/qr-session/${token}/status`, {
+        headers: {
+          'ngrok-skip-browser-warning': 'true',
+        },
+        signal: AbortSignal.timeout(2500),
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        if (data.success) {
+          return data as SharedMobileQRSessionStatus;
+        }
+      }
+    } catch (err) {
+      console.warn('[ApiService] Failed to poll shared mobile QR status:', err);
+    }
+    return null;
+  }
+
+  static async closeSharedMobileQRSession(token: string): Promise<boolean> {
+    const baseUrl = this.getMobileApiBaseUrl();
+    try {
+      const response = await fetch(`${baseUrl}/api/classes/qr-session/${token}/close`, {
+        method: 'POST',
+        headers: {
+          'ngrok-skip-browser-warning': 'true',
+        },
+        signal: AbortSignal.timeout(2500),
+      });
+      return response.ok;
+    } catch {
+      return false;
+    }
   }
 }
 
