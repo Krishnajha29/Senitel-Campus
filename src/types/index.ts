@@ -385,3 +385,58 @@ export interface SubmitClassroomPhotoBatchResult {
   session: PhotoUploadSession;
 }
 
+// -------------------------------------------------------------
+// Shared Mobile QR Session Contract (Sentinel Campus Mobile App)
+// -------------------------------------------------------------
+export interface SharedMobileQRSession {
+  id: string;
+  token: string;
+  classId: string;
+  sessionId: string;
+  courseCode: string;
+  courseName: string;
+  teacherId: string;
+  checkpointType: 'checkpoint_1' | 'checkpoint_2';
+  createdAt: string;
+  expiresAt: string;
+  isActive: boolean;
+  remainingSeconds: number;
+  qrPayload: string;
+}
+
+export interface SharedMobileQRCaptureItem {
+  id: string;
+  studentId: string;
+  studentName: string;
+  identifierCode: string;
+  capturedAt: string;
+  faceDistance: number;
+  status: 'confirmed' | 'unmatched' | 'ambiguous' | 'duplicate';
+  thumbnailUrl?: string;
+  processingTimeMs: number;
+  checkpointType: 'checkpoint_1' | 'checkpoint_2';
+}
+
+export interface SharedMobileQRSessionStatus {
+  success: boolean;
+  session: SharedMobileQRSession;
+  stats: {
+    totalStudents: number;
+    identifiedCount: number;
+    pendingCount: number;
+    rejectedCount: number;
+    notCapturedCount: number;
+  };
+  rosterBreakdown: Array<{
+    studentId: string;
+    fullName: string;
+    identifierCode: string;
+    department?: string;
+    status: 'confirmed' | 'pending' | 'rejected' | 'not_captured';
+    capturedAt: string | null;
+    faceDistance: number | null;
+    thumbnailUrl: string | null;
+  }>;
+  recentCaptures: SharedMobileQRCaptureItem[];
+}
+
